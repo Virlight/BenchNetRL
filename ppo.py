@@ -12,6 +12,13 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+class VideoResetWrapper(gym.Wrapper):
+    def reset_video_recorder(self):
+        if hasattr(self.env, 'video_recorder'):
+            self.env.video_recorder.close()
+            self.env.video_recorder = None
+            self.env.start_video_recorder()
+
 # Initialize lists to store episodic returns and timesteps
 episodic_returns = []
 episodic_lengths = []
@@ -81,13 +88,17 @@ def parse_args():
 
 def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
-        env = gym.make(gym_id, render_mode='rgb_array')
+        env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video and idx == 0:
             env = gym.make(gym_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda episode_id: episode_id == 500)
-        else:
-            env = gym.make(gym_id)
+            env = gym.wrappers.RecordVideo(
+                env, 
+                f"videos/{run_name}", 
+                episode_trigger=lambda episode_id: episode_id == args.num_steps,
+                name_prefix=f"agent_{idx}"
+            )
+            env = VideoResetWrapper(env)
         env.observation_space.seed(seed)
         return env
 
@@ -215,13 +226,15 @@ if __name__ == "__main__":
                     final_info = info['final_info'][idx]
                     if 'episode' in final_info:
                         episode_info = final_info['episode']
-                        print(f"global_step={global_step}, episodic_return={episode_info['r']}")
-                        writer.add_scalar("charts/episodic_return", episode_info['r'], global_step)
-                        writer.add_scalar("charts/episodic_length", episode_info['l'], global_step)
+                        episodic_return = episode_info['r']
+                        episodic_length = episode_info['l']
+                        print(f"global_step={global_step}, episodic_return={episodic_return}")
+                        writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                        writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
                         # Append to local lists
-                        episodic_returns.append(episode_info['r'])
-                        episodic_lengths.append(episode_info['l'])
+                        episodic_returns.append(episodic_return)
+                        episodic_lengths.append(episodic_length)
                         episodic_timesteps.append(global_step)
 
         # bootstrap value if not done
@@ -305,6 +318,7 @@ if __name__ == "__main__":
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -319,8 +333,13 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        # Log action probabilities histogram
+        with torch.no_grad():
+            action_probs = torch.softmax(agent.actor(b_obs), dim=-1)
+
+        # Record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_histogram("actions/probabilities", action_probs, global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -337,6 +356,9 @@ if __name__ == "__main__":
             timesteps=np.array(episodic_timesteps),
             returns=np.array(episodic_returns),
             lengths=np.array(episodic_lengths))
+    
+    if args.capture_video and args.track:
+        wandb.save(f"videos/{run_name}/*.mp4")
 
     envs.close()
     writer.close()
