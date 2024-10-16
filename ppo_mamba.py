@@ -12,17 +12,14 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-class VideoResetWrapper(gym.Wrapper):
-    def reset_video_recorder(self):
-        if hasattr(self.env, 'video_recorder'):
-            self.env.video_recorder.close()
-            self.env.video_recorder = None
-            self.env.start_video_recorder()
+# Import Mamba
+from mamba_ssm import Mamba
 
 # Initialize lists to store episodic returns and timesteps
 episodic_returns = []
 episodic_lengths = []
 episodic_timesteps = []
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -90,15 +87,9 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
         env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if capture_video and idx == 0:
-            env = gym.make(gym_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(
-                env, 
-                f"videos/{run_name}", 
-                episode_trigger=lambda episode_id: episode_id == args.num_steps,
-                name_prefix=f"agent_{idx}"
-            )
-            env = VideoResetWrapper(env)
+        if capture_video:
+            if idx == 0:
+                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -108,37 +99,50 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
+    if layer.bias is not None:
+        torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, device):
         super(Agent, self).__init__()
-        self.critic = nn.Sequential(
+        self.device = device
+        self.network = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
-        )
+        self.input_proj = layer_init(nn.Linear(64, 128))
+        self.mamba = Mamba(
+            d_model=128,  # Model dimension
+            d_state=16,   # SSM state expansion factor
+            d_conv=4,     # Local convolution width
+            expand=2,     # Block expansion factor
+        ).to(device)
+        self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(128, 1), std=1)
+
+    def get_states(self, x):
+        hidden = self.network(x)          # Shape: (batch_size, 64)
+        hidden = self.input_proj(hidden)  # Shape: (batch_size, 128)
+        hidden = hidden.unsqueeze(1)      # Shape: (batch_size, 1, 128)
+        output = self.mamba(hidden)       # Shape: (batch_size, 1, 128)
+        output = output.squeeze(1)        # Shape: (batch_size, 128)
+        return output
 
     def get_value(self, x):
-        return self.critic(x)
+        hidden = self.get_states(x)
+        return self.critic(hidden)
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        hidden = self.get_states(x)
+        logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
 
 if __name__ == "__main__":
@@ -169,7 +173,6 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    print(device)
 
     # Env setup
     envs = gym.vector.SyncVectorEnv(
@@ -177,7 +180,7 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, device).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # Storage setup
@@ -217,9 +220,9 @@ if __name__ == "__main__":
             # Execute the game and log data.
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
+            rewards[step] = torch.tensor(reward).to(device)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
-            
+
             # Iterate over each environment
             for idx in range(args.num_envs):
                 # Check if 'final_info' is in 'info' and not None for this environment
@@ -266,29 +269,34 @@ if __name__ == "__main__":
                     returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
                 advantages = returns - values
 
-        # flatten the batch
+        # Flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_dones = dones.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        assert args.num_envs % args.num_minibatches == 0
+        envsperbatch = args.num_envs // args.num_minibatches
+        envinds = np.arange(args.num_envs)
+        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(envinds)
+            for start in range(0, args.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -319,7 +327,6 @@ if __name__ == "__main__":
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-                writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
                 loss.backward()
