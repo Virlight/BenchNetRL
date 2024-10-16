@@ -1,7 +1,8 @@
 # results
 results/
 runs/
-
+wandb/
+videos/
 
 #official python gitignore
 # Byte-compiled / optimized / DLL files
