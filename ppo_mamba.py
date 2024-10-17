@@ -12,14 +12,12 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-# Import Mamba
 from mamba_ssm import Mamba
 
 # Initialize lists to store episodic returns and timesteps
 episodic_returns = []
 episodic_lengths = []
 episodic_timesteps = []
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -87,9 +85,14 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
         env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if capture_video:
-            if idx == 0:
-                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        if capture_video and idx == 0:
+            env = gym.make(gym_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(
+                env, 
+                f"videos/{run_name}", 
+                episode_trigger=lambda episode_id: episode_id == args.num_steps,
+                name_prefix=f"agent_{idx}"
+            )
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -105,9 +108,8 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, device):
+    def __init__(self, envs):
         super(Agent, self).__init__()
-        self.device = device
         self.network = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -120,7 +122,7 @@ class Agent(nn.Module):
             d_state=16,   # SSM state expansion factor
             d_conv=4,     # Local convolution width
             expand=2,     # Block expansion factor
-        ).to(device)
+        )
         self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(128, 1), std=1)
 
@@ -173,6 +175,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(device)
 
     # Env setup
     envs = gym.vector.SyncVectorEnv(
@@ -180,7 +183,7 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs, device).to(device)
+    agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # Storage setup
@@ -220,7 +223,7 @@ if __name__ == "__main__":
             # Execute the game and log data.
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
-            rewards[step] = torch.tensor(reward).to(device)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
             # Iterate over each environment
@@ -269,7 +272,7 @@ if __name__ == "__main__":
                     returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
                 advantages = returns - values
 
-        # Flatten the batch
+        # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -296,7 +299,7 @@ if __name__ == "__main__":
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -327,6 +330,7 @@ if __name__ == "__main__":
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -359,7 +363,7 @@ if __name__ == "__main__":
             timesteps=np.array(episodic_timesteps),
             returns=np.array(episodic_returns),
             lengths=np.array(episodic_lengths))
-    
+
     if args.capture_video and args.track:
         wandb.save(f"videos/{run_name}/*.mp4")
 
