@@ -12,6 +12,13 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+class VideoResetWrapper(gym.Wrapper):
+    def reset_video_recorder(self):
+        if hasattr(self.env, 'video_recorder'):
+            self.env.video_recorder.close()
+            self.env.video_recorder = None
+            self.env.start_video_recorder()
+
 # Initialize lists to store episodic returns and timesteps
 episodic_returns = []
 episodic_lengths = []
@@ -91,6 +98,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
                 episode_trigger=lambda episode_id: episode_id == args.num_steps,
                 name_prefix=f"agent_{idx}"
             )
+            env = VideoResetWrapper(env)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -211,7 +219,7 @@ if __name__ == "__main__":
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
-
+            
             # Iterate over each environment
             for idx in range(args.num_envs):
                 # Check if 'final_info' is in 'info' and not None for this environment
@@ -344,7 +352,7 @@ if __name__ == "__main__":
             timesteps=np.array(episodic_timesteps),
             returns=np.array(episodic_returns),
             lengths=np.array(episodic_lengths))
-
+    
     if args.capture_video and args.track:
         wandb.save(f"videos/{run_name}/*.mp4")
 
