@@ -4,6 +4,8 @@ import random
 import time
 from distutils.util import strtobool
 
+from collections import deque
+
 import gym
 import numpy as np
 import torch
@@ -11,6 +13,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+
+# Import Mamba
+from mamba_ssm import Mamba
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -68,6 +73,8 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--seq-len", type=int, default=4,
+        help="sequence length for Mamba model")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -89,40 +96,56 @@ def make_env(gym_id, seed):
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
+    if layer.bias is not None:
+        torch.nn.init.constant_(layer.bias, bias_const)
     return layer
-
 
 class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+        input_dim = np.array(envs.single_observation_space.shape).prod()
+        self.base_network = nn.Sequential(
+            layer_init(nn.Linear(input_dim, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+        self.input_proj = layer_init(nn.Linear(64, 128))
+        self.mamba = Mamba(
+            d_model=128,
+            d_state=16,
+            d_conv=4,
+            expand=2,
         )
+        self.critic = layer_init(nn.Linear(128, 1), std=1.0)
+        self.actor_mean = layer_init(nn.Linear(128, np.prod(envs.single_action_space.shape)), std=0.01)
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
+    def get_states(self, x):
+        # x has shape (batch_size, seq_len, obs_dim)
+        batch_size, seq_len, obs_dim = x.shape
+        x = x.view(batch_size * seq_len, obs_dim)
+        base_out = self.base_network(x)          # Shape: (batch_size * seq_len, 64)
+        proj_out = self.input_proj(base_out)     # Shape: (batch_size * seq_len, 128)
+        proj_out = proj_out.view(batch_size, seq_len, -1)
+        mamba_out = self.mamba(proj_out)         # Shape: (batch_size, seq_len, 128)
+        return mamba_out
+
     def get_value(self, x):
-        return self.critic(x)
+        hidden = self.get_states(x)
+        last_hidden = hidden[:, -1, :]
+        return self.critic(last_hidden)
 
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
+        hidden = self.get_states(x)
+        last_hidden = hidden[:, -1, :]
+        action_mean = self.actor_mean(last_hidden)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(last_hidden)
 
 if __name__ == "__main__":
     args = parse_args()
@@ -162,8 +185,14 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    # Initialize observation buffers
+    sequence_length = args.seq_len
+    obs_shape = (sequence_length,) + envs.single_observation_space.shape
+    obs_buffers = [deque(maxlen=sequence_length) for _ in range(args.num_envs)]
+    obs_dim = envs.single_observation_space.shape[0]
+
     # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + obs_shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -176,6 +205,11 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
+    # Initialize buffers
+    for i in range(args.num_envs):
+        for _ in range(sequence_length):
+            obs_buffers[i].append(next_obs[i].cpu().numpy())
+
     for update in range(1, num_updates + 1):
         # Annealing the learning rate
         if args.anneal_lr:
@@ -185,12 +219,20 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            obs[step] = next_obs
             dones[step] = next_done
+
+            # Update buffers
+            for i in range(args.num_envs):
+                obs_buffers[i].append(next_obs[i].cpu().numpy())
+
+            # Prepare sequences
+            obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])  # Shape: (num_envs, seq_len, obs_dim)
+            obs_sequences = torch.tensor(obs_sequences, dtype=torch.float32).to(device)
+            obs[step] = obs_sequences
 
             # Action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(obs_sequences)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -202,9 +244,13 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            # Iterate over each environment
+            # Reset buffers for environments that are done
+            for i, d in enumerate(done):
+                if d:
+                    obs_buffers[i] = deque([next_obs[i].cpu().numpy()] * sequence_length, maxlen=sequence_length)
+
+            # Log episodic returns
             for idx in range(args.num_envs):
-                # Check if 'final_info' is in 'info' and not None for this environment
                 if 'final_info' in info and info['final_info'][idx] is not None:
                     final_info = info['final_info'][idx]
                     if 'episode' in final_info:
@@ -215,8 +261,11 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/episodic_return", episodic_return, global_step)
                         writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
+        # Bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])
+            obs_sequences = torch.tensor(obs_sequences, dtype=torch.float32).to(device)
+            next_value = agent.get_value(obs_sequences).view(1, -1)
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
@@ -242,51 +291,72 @@ if __name__ == "__main__":
                     returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
                 advantages = returns - values
 
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        # Flatten the batch but keep the sequence dimension
+        b_obs = obs.transpose(1, 0)  # Shape: (num_envs, num_steps, seq_len, obs_dim)
+        b_logprobs = logprobs.transpose(1, 0)
+        b_actions = actions.transpose(1, 0)
+        b_advantages = advantages.transpose(1, 0)
+        b_returns = returns.transpose(1, 0)
+        b_values = values.transpose(1, 0)
 
-        b_inds = np.arange(args.batch_size)
+        # Optimizing the policy and value network
+        assert args.num_envs * args.num_steps % args.minibatch_size == 0
+        num_minibatches = args.num_envs * args.num_steps // args.minibatch_size
+        mb_size = args.minibatch_size
+
+        inds = np.arange(args.num_envs * args.num_steps)
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(inds)
+            for start in range(0, args.num_envs * args.num_steps, mb_size):
+                end = start + mb_size
+                mb_inds = inds[start:end]
+                env_inds = mb_inds // args.num_steps
+                step_inds = mb_inds % args.num_steps
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
+                mb_obs = b_obs[env_inds, step_inds].reshape(-1, sequence_length, obs_dim)
+                mb_actions = b_actions[env_inds, step_inds].reshape(-1, *envs.single_action_space.shape)
+                mb_logprobs = b_logprobs[env_inds, step_inds].reshape(-1)
+                mb_advantages = b_advantages[env_inds, step_inds].reshape(-1)
+                mb_returns = b_returns[env_inds, step_inds].reshape(-1)
+                mb_values = b_values[env_inds, step_inds].reshape(-1)
+
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions)
+                newlogprob = newlogprob.view(-1)
+                entropy = entropy.view(-1)
+                newvalue = newvalue.view(-1)
+
+                # Compute ratios
+                logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
                 with torch.no_grad():
+                    # Calculate approx_kl
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
-                mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
+                # Policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                newvalue = newvalue.view(-1)
+                # Value loss
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_loss_unclipped = (newvalue - mb_returns) ** 2
+                    v_clipped = mb_values + torch.clamp(
+                        newvalue - mb_values,
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
