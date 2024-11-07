@@ -12,18 +12,6 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-class VideoResetWrapper(gym.Wrapper):
-    def reset_video_recorder(self):
-        if hasattr(self.env, 'video_recorder'):
-            self.env.video_recorder.close()
-            self.env.video_recorder = None
-            self.env.start_video_recorder()
-
-# Initialize lists to store episodic returns and timesteps
-episodic_returns = []
-episodic_lengths = []
-episodic_timesteps = []
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
@@ -86,23 +74,13 @@ def parse_args():
     return args
 
 
-def make_env(gym_id, seed, idx, capture_video, run_name):
+def make_env(gym_id, seed):
     def thunk():
         env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if capture_video and idx == 0:
-            env = gym.make(gym_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(
-                env, 
-                f"videos/{run_name}", 
-                episode_trigger=lambda episode_id: episode_id == args.num_steps,
-                name_prefix=f"agent_{idx}"
-            )
-            env = VideoResetWrapper(env)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
-
     return thunk
 
 
@@ -169,11 +147,10 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    print(device)
 
     # Env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(args.gym_id, args.seed + i) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
@@ -214,7 +191,7 @@ if __name__ == "__main__":
             actions[step] = action
             logprobs[step] = logprob
 
-            # Execute the game and log data.
+            # Execute the game and log data
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
@@ -232,11 +209,6 @@ if __name__ == "__main__":
                         print(f"global_step={global_step}, episodic_return={episodic_return}")
                         writer.add_scalar("charts/episodic_return", episodic_return, global_step)
                         writer.add_scalar("charts/episodic_length", episodic_length, global_step)
-
-                        # Append to local lists
-                        episodic_returns.append(episodic_return)
-                        episodic_lengths.append(episodic_length)
-                        episodic_timesteps.append(global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -288,7 +260,7 @@ if __name__ == "__main__":
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -345,16 +317,6 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-    # Save results and clean up
-    os.makedirs('results', exist_ok=True)
-    np.savez(f"results/{run_name}.npz",
-            timesteps=np.array(episodic_timesteps),
-            returns=np.array(episodic_returns),
-            lengths=np.array(episodic_lengths))
-    
-    if args.capture_video and args.track:
-        wandb.save(f"videos/{run_name}/*.mp4")
 
     envs.close()
     writer.close()
