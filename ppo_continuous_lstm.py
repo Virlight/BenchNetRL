@@ -22,7 +22,7 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
-    parser.add_argument("--total-timesteps", type=int, default=2000000,
+    parser.add_argument("--total-timesteps", type=int, default=8000000,
         help="total timesteps of the experiments")
     parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
@@ -50,7 +50,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=32,
+    parser.add_argument("--num-minibatches", type=int, default=1,
         help="the number of mini-batches")
     parser.add_argument("--update-epochs", type=int, default=10,
         help="the K epochs to update the policy")
@@ -96,60 +96,68 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
-        self.feature_extractor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+        obs_shape = envs.single_observation_space.shape
+        action_shape = envs.single_action_space.shape
+
+        # Base network
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(np.prod(obs_shape), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
         )
-        
-        self.lstm = nn.LSTM(64, 128)  # LSTM with 128 hidden units
+
+        # LSTM layer
+        self.lstm = nn.LSTM(64, 128)
         for name, param in self.lstm.named_parameters():
             if "bias" in name:
                 nn.init.constant_(param, 0)
             elif "weight" in name:
                 nn.init.orthogonal_(param, 1.0)
-        
-        self.actor_mean = layer_init(nn.Linear(128, np.prod(envs.single_action_space.shape)), std=0.01)
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
-        self.critic = layer_init(nn.Linear(128, 1), std=1.0)
+
+        # Actor and Critic heads
+        self.actor_mean = layer_init(nn.Linear(128, np.prod(action_shape)), std=0.01)
+        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(action_shape)))
+        self.critic = layer_init(nn.Linear(128, 1), std=1)
 
     def get_states(self, x, lstm_state, done):
-        features = self.feature_extractor(x)
-        
-        # Prepare data for LSTM
-        batch_size = lstm_state[0].shape[1]
-        features = features.reshape((-1, batch_size, self.lstm.input_size))
-        done = done.reshape((-1, batch_size))
-        
-        # LSTM forward pass with resets for done environments
+        # x: [batch_size, obs_dim]
+        hidden = self.network(x)
+
+        batch_size = lstm_state[0].shape[1]  # Number of environments
+        hidden = hidden.reshape(-1, batch_size, self.lstm.input_size)  # [seq_len, batch_size, input_size]
+        done = done.reshape(-1, batch_size)  # [seq_len, batch_size]
+
         new_hidden = []
-        for feature, d in zip(features, done):
-            feature, lstm_state = self.lstm(
-                feature.unsqueeze(0),
-                (
-                    (1.0 - d).view(1, -1, 1) * lstm_state[0],
-                    (1.0 - d).view(1, -1, 1) * lstm_state[1],
-                ),
+        for h, d in zip(hidden, done):
+            # Reset LSTM state where done is True
+            lstm_state = (
+                (1 - d).view(1, -1, 1) * lstm_state[0],
+                (1 - d).view(1, -1, 1) * lstm_state[1],
             )
-            new_hidden.append(feature)
-        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+            h, lstm_state = self.lstm(h.unsqueeze(0), lstm_state)
+            new_hidden.append(h)
+
+        new_hidden = torch.flatten(torch.cat(new_hidden, dim=0), 0, 1)
         return new_hidden, lstm_state
 
     def get_value(self, x, lstm_state, done):
         hidden, _ = self.get_states(x, lstm_state, done)
-        return self.critic(hidden)
+        value = self.critic(hidden)
+        return value
 
     def get_action_and_value(self, x, lstm_state, done, action=None):
         hidden, lstm_state = self.get_states(x, lstm_state, done)
         action_mean = self.actor_mean(hidden)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
-        
+        dist = Normal(action_mean, action_std)
         if action is None:
-            action = probs.sample()
-        
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(hidden), lstm_state
-
+            action = dist.sample()
+        logprob = dist.log_prob(action).sum(-1)
+        entropy = dist.entropy().sum(-1)
+        value = self.critic(hidden)
+        return action, logprob, entropy, value, lstm_state
 
 if __name__ == "__main__":
     args = parse_args()
@@ -209,7 +217,6 @@ if __name__ == "__main__":
 
     for update in range(1, num_updates + 1):
         initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
-
         # Annealing the learning rate
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -223,9 +230,7 @@ if __name__ == "__main__":
 
             # Action logic
             with torch.no_grad():
-                action, logprob, _, value, next_lstm_state = agent.get_action_and_value(
-                    next_obs, next_lstm_state, next_done
-                )
+                action, logprob, _, value, next_lstm_state = agent.get_action_and_value(next_obs, next_lstm_state, next_done)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -251,7 +256,11 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(
+                next_obs,
+                next_lstm_state,
+                next_done,
+            ).reshape(1, -1)
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
@@ -285,27 +294,25 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        b_inds = np.arange(args.batch_size)
+        # Optimizing the policy and value network
+        assert args.num_envs % args.num_minibatches == 0
+        envsperbatch = args.num_envs // args.num_minibatches
+        envinds = np.arange(args.num_envs)
+        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
-
-                # LSTM state slicing for minibatches
-                mb_lstm_state = (
-                    initial_lstm_state[0][:, mb_inds],
-                    initial_lstm_state[1][:, mb_inds],
-                )
+            np.random.shuffle(envinds)
+            for start in range(0, args.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
 
                 _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
                     b_obs[mb_inds],
-                    mb_lstm_state,
+                    (initial_lstm_state[0][:, mbenvinds], initial_lstm_state[1][:, mbenvinds]),
                     b_dones[mb_inds],
-                    b_actions[mb_inds],
+                    b_actions.long()[mb_inds],
                 )
-
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
