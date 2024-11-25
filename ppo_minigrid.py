@@ -30,7 +30,7 @@ class RemoveMissionWrapper(gym.ObservationWrapper):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp-name", type=str, default="PPO_MiniGrid",
+    parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
     parser.add_argument("--gym-id", type=str, default="MiniGrid-Empty-8x8-v0",
         help="the id of the gym environment")

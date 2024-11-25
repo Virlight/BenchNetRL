@@ -4,8 +4,6 @@ import random
 import time
 from distutils.util import strtobool
 
-from collections import deque
-
 import gym
 import minigrid
 from gym.spaces import Box, Discrete, Dict
@@ -15,9 +13,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-
-# Import Mamba
-from mamba_ssm import Mamba
 
 class RemoveMissionWrapper(gym.ObservationWrapper):
     def __init__(self, env):
@@ -34,7 +29,7 @@ class RemoveMissionWrapper(gym.ObservationWrapper):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp-name", type=str, default="PPO_MiniGrid_Mamba",
+    parser.add_argument("--exp-name", type=str, default="ppo_minigrid_lstm",
         help="the name of this experiment")
     parser.add_argument("--gym-id", type=str, default="MiniGrid-Empty-8x8-v0",
         help="the id of the gym environment")
@@ -50,7 +45,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="ppo-minigrid-mamba",
+    parser.add_argument("--wandb-project-name", type=str, default="ppo-minigrid-lstm",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -58,7 +53,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--num-envs", type=int, default=1,
+    parser.add_argument("--num-envs", type=int, default=8,
         help="the number of parallel game environments")
     parser.add_argument("--num-steps", type=int, default=128,
         help="the number of steps to run in each environment per policy rollout")
@@ -88,8 +83,6 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--seq-len", type=int, default=4,
-        help="sequence length for Mamba model")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -109,8 +102,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
-    if layer.bias is not None:
-        torch.nn.init.constant_(layer.bias, bias_const)
+    torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 class Agent(nn.Module):
@@ -135,68 +127,63 @@ class Agent(nn.Module):
 
         self.direction_embedding = nn.Embedding(direction_shape, 32)
 
-        # Input projection layer to match Mamba's d_model
-        self.input_proj = layer_init(nn.Linear(cnn_output_size + 32, 128))
-
-        # Mamba module
-        self.mamba = Mamba(
-            d_model=128,
-            d_state=16,
-            d_conv=4,
-            expand=2,
+        self.fc = nn.Sequential(
+            layer_init(nn.Linear(cnn_output_size + 32, 256)),
+            nn.ReLU(),
         )
+
+        self.lstm = nn.LSTM(256, 128)
+        for name, param in self.lstm.named_parameters():
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name:
+                nn.init.orthogonal_(param, 1.0)
 
         self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(128, 1), std=1.0)
 
-    def get_states(self, obs):
-        # obs is a dict of sequences
-        # obs['image']: (batch_size, seq_len, 7, 7, 3)
-        # obs['direction']: (batch_size, seq_len)
-
-        batch_size, seq_len = obs['direction'].shape[0], obs['direction'].shape[1]
-        # Flatten batch and seq_len dimensions to process all observations
-        images = obs['image'].reshape(batch_size * seq_len, *obs['image'].shape[2:])  # (batch_size * seq_len, 7, 7, 3)
-        directions = obs['direction'].reshape(batch_size * seq_len)  # (batch_size * seq_len,)
+    def forward(self, obs):
+        image = obs['image']  # Tensor of shape (batch_size, 7, 7, 3)
+        direction = obs['direction']  # Tensor of shape (batch_size,)
 
         # Process image
-        images = images.permute(0, 3, 1, 2)  # Convert to (batch_size * seq_len, 3, 7, 7)
-        images = images.float() / 255.0  # Normalize pixel values
-        image_features = self.image_conv(images)  # (batch_size * seq_len, cnn_output_size)
+        image = image.permute(0, 3, 1, 2)  # Convert to (batch_size, 3, 7, 7)
+        image = image.float() / 255.0  # Normalize pixel values
+        image_features = self.image_conv(image)  # (batch_size, cnn_output_size)
 
         # Process direction
-        direction_embed = self.direction_embedding(directions)  # (batch_size * seq_len, 32)
+        direction_embed = self.direction_embedding(direction)  # (batch_size, 32)
 
         # Combine features
-        features = torch.cat([image_features, direction_embed], dim=1)  # (batch_size * seq_len, cnn_output_size + 32)
-        features = self.input_proj(features)  # (batch_size * seq_len, 128)
+        features = torch.cat([image_features, direction_embed], dim=1)  # (batch_size, cnn_output_size + 32)
+        hidden = self.fc(features)
+        return hidden
 
-        # Reshape back to (batch_size, seq_len, 128)
-        features = features.view(batch_size, seq_len, -1)
+    def get_states(self, obs, lstm_state, done):
+        hidden = self.forward(obs)
+        hidden = hidden.unsqueeze(0)  # Add sequence dimension
 
-        # Pass through Mamba
-        mamba_out = self.mamba(features)  # (batch_size, seq_len, 128)
+        # LSTM logic
+        done = done.unsqueeze(0).unsqueeze(-1)
+        lstm_state = (
+            (1 - done) * lstm_state[0],
+            (1 - done) * lstm_state[1],
+        )
+        lstm_out, lstm_state = self.lstm(hidden, lstm_state)
+        lstm_out = lstm_out.squeeze(0)  # Remove sequence dimension
+        return lstm_out, lstm_state
 
-        return mamba_out
+    def get_value(self, obs, lstm_state, done):
+        lstm_out, _ = self.get_states(obs, lstm_state, done)
+        return self.critic(lstm_out)
 
-    def get_value(self, obs):
-        hidden = self.get_states(obs)
-        last_hidden = hidden[:, -1, :]
-        return self.critic(last_hidden)
-
-    def get_action_and_value(self, obs, action=None):
-        hidden = self.get_states(obs)
-        last_hidden = hidden[:, -1, :]
-        logits = self.actor(last_hidden)
+    def get_action_and_value(self, obs, lstm_state, done, action=None):
+        lstm_out, lstm_state = self.get_states(obs, lstm_state, done)
+        logits = self.actor(lstm_out)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        else:
-            action = action.view(-1)
-        logprob = probs.log_prob(action)
-        entropy = probs.entropy()
-        value = self.critic(last_hidden)
-        return action, logprob, entropy, value
+        return action, probs.log_prob(action), probs.entropy(), self.critic(lstm_out), lstm_state
 
 if __name__ == "__main__":
     args = parse_args()
@@ -239,14 +226,10 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # Initialize observation buffers
-    sequence_length = args.seq_len
-    obs_buffers = [deque(maxlen=sequence_length) for _ in range(args.num_envs)]
-
     # Storage setup
     obs = {
-        'image': torch.zeros((args.num_steps, args.num_envs, sequence_length) + envs.single_observation_space['image'].shape).to(device),
-        'direction': torch.zeros((args.num_steps, args.num_envs, sequence_length), dtype=torch.long).to(device),
+        'image': torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space['image'].shape).to(device),
+        'direction': torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device),
     }
     actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -263,17 +246,14 @@ if __name__ == "__main__":
         'direction': torch.tensor(next_obs_raw['direction']).to(device),
     }
     next_done = torch.zeros(args.num_envs).to(device)
+    next_lstm_state = (
+        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
+        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
+    )
     num_updates = args.total_timesteps // args.batch_size
 
-    # Initialize buffers
-    for i in range(args.num_envs):
-        for _ in range(sequence_length):
-            obs_buffers[i].append({
-                'image': next_obs['image'][i].cpu().numpy(),
-                'direction': next_obs['direction'][i].cpu().numpy(),
-            })
-
     for update in range(1, num_updates + 1):
+        initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
         # Annealing the learning rate
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -282,30 +262,15 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
+            obs['image'][step] = next_obs['image']
+            obs['direction'][step] = next_obs['direction']
             dones[step] = next_done
-
-            # Update buffers
-            for i in range(args.num_envs):
-                obs_buffers[i].append({
-                    'image': next_obs['image'][i].cpu().numpy(),
-                    'direction': next_obs['direction'][i].cpu().numpy(),
-                })
-
-            # Prepare sequences
-            obs_sequences = {
-                'image': np.array([[obs_buffers[i][j]['image'] for j in range(sequence_length)] for i in range(args.num_envs)]),
-                'direction': np.array([[obs_buffers[i][j]['direction'] for j in range(sequence_length)] for i in range(args.num_envs)]),
-            }
-            obs_sequences = {
-                'image': torch.tensor(obs_sequences['image'], dtype=torch.float32).to(device),
-                'direction': torch.tensor(obs_sequences['direction'], dtype=torch.long).to(device),
-            }
-            obs['image'][step] = obs_sequences['image']
-            obs['direction'][step] = obs_sequences['direction']
 
             # Action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(obs_sequences)
+                action, logprob, _, value, next_lstm_state = agent.get_action_and_value(
+                    next_obs, next_lstm_state, next_done
+                )
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -320,14 +285,6 @@ if __name__ == "__main__":
             }
             next_done = torch.tensor(done, dtype=torch.float32).to(device)
 
-            # Reset buffers for environments that are done
-            for i, d in enumerate(done):
-                if d:
-                    obs_buffers[i] = deque([{
-                        'image': next_obs['image'][i].cpu().numpy(),
-                        'direction': next_obs['direction'][i].cpu().numpy(),
-                    }] * sequence_length, maxlen=sequence_length)
-
             # Log episodic returns
             for idx, item in enumerate(info['final_info']):
                 if item is not None:
@@ -339,16 +296,9 @@ if __name__ == "__main__":
 
         # Bootstrap value if not done
         with torch.no_grad():
-            # Prepare sequences
-            obs_sequences = {
-                'image': np.array([[obs_buffers[i][j]['image'] for j in range(sequence_length)] for i in range(args.num_envs)]),
-                'direction': np.array([[obs_buffers[i][j]['direction'] for j in range(sequence_length)] for i in range(args.num_envs)]),
-            }
-            obs_sequences = {
-                'image': torch.tensor(obs_sequences['image'], dtype=torch.float32).to(device),
-                'direction': torch.tensor(obs_sequences['direction'], dtype=torch.long).to(device),
-            }
-            next_value = agent.get_value(obs_sequences).reshape(1, -1)
+            next_value = agent.get_value(
+                next_obs, next_lstm_state, next_done
+            ).reshape(1, -1)
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
@@ -376,23 +326,28 @@ if __name__ == "__main__":
 
         # Flatten the batch
         b_obs = {
-            'image': obs['image'].reshape(-1, sequence_length, *envs.single_observation_space['image'].shape),
-            'direction': obs['direction'].reshape(-1, sequence_length),
+            'image': obs['image'].reshape((-1,) + envs.single_observation_space['image'].shape),
+            'direction': obs['direction'].reshape(-1),
         }
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape(-1)
+        b_dones = dones.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        assert args.num_envs % args.num_minibatches == 0
+        envsperbatch = args.num_envs // args.num_minibatches
+        envinds = np.arange(args.num_envs)
+        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(envinds)
+            for start in range(0, args.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                mb_inds = flatinds[:, mbenvinds].ravel()
 
                 mb_obs = {
                     'image': b_obs['image'][mb_inds],
@@ -403,8 +358,16 @@ if __name__ == "__main__":
                 mb_advantages = b_advantages[mb_inds]
                 mb_returns = b_returns[mb_inds]
                 mb_values = b_values[mb_inds]
+                mb_dones = b_dones[mb_inds]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions)
+                lstm_state = (
+                    initial_lstm_state[0][:, mbenvinds],
+                    initial_lstm_state[1][:, mbenvinds],
+                )
+
+                _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
+                    mb_obs, lstm_state, mb_dones, mb_actions
+                )
                 logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
