@@ -6,6 +6,7 @@ from distutils.util import strtobool
 
 import gym
 import minigrid
+import gym_minigrid
 from gym.spaces import Box, Discrete, Dict
 import numpy as np
 import torch
@@ -16,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 class RemoveMissionWrapper(gym.ObservationWrapper):
     def __init__(self, env):
-        gym.ObservationWrapper.__init__(self, env)
+        gym.ObservationWrapper.__init__(self, env)  # Explicitly call the base class's __init__
         # Modify the observation space to exclude 'mission'
         original_space = self.observation_space
         self.observation_space = gym.spaces.Dict({
@@ -65,7 +66,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=4,
+    parser.add_argument("--num-minibatches", type=int, default=1,
         help="the number of mini-batches")
     parser.add_argument("--update-epochs", type=int, default=4,
         help="the K epochs to update the policy")
@@ -95,6 +96,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        #env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -217,7 +219,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # Environment setup
-    envs = gym.vector.AsyncVectorEnv(
+    envs = gym.vector.SyncVectorEnv(
         [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, Discrete), "only discrete action space is supported"
@@ -240,10 +242,12 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs_raw = envs.reset(seed=args.seed)
+    next_obs = envs.reset(seed=args.seed)
+    #next_obs = envs.reset()
+    #print(next_obs)
     next_obs = {
-        'image': torch.tensor(next_obs_raw['image']).to(device),
-        'direction': torch.tensor(next_obs_raw['direction']).to(device),
+        'image': torch.tensor(next_obs[0]['image']).to(device),
+        'direction': torch.tensor(next_obs[0]['direction']).to(device),
     }
     next_done = torch.zeros(args.num_envs).to(device)
     next_lstm_state = (
@@ -285,14 +289,19 @@ if __name__ == "__main__":
             }
             next_done = torch.tensor(done, dtype=torch.float32).to(device)
 
-            # Log episodic returns
-            for idx, item in enumerate(info['final_info']):
-                if item is not None:
-                    episodic_return = item['episode']['r']
-                    episodic_length = item['episode']['l']
-                    print(f"global_step={global_step}, episodic_return={episodic_return}")
-                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
-                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+            #print(info)
+            # Iterate over each environment
+            for idx in range(args.num_envs):
+                # Check if 'final_info' is in 'info' and not None for this environment
+                if 'final_info' in info and info['final_info'][idx] is not None:
+                    final_info = info['final_info'][idx]
+                    if 'episode' in final_info:
+                        episode_info = final_info['episode']
+                        episodic_return = episode_info['r']
+                        episodic_length = episode_info['l']
+                        print(f"global_step={global_step}, episodic_return={episodic_return}")
+                        writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                        writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
         # Bootstrap value if not done
         with torch.no_grad():

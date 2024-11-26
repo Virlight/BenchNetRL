@@ -96,7 +96,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
                 #print(elem)
                 pass
         env = gym.make(gym_id)
-        env = RemoveMissionWrapper(env)  # Apply the wrapper here
+        env = RemoveMissionWrapper(env)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.RecordEpisodeStatistics(env)
