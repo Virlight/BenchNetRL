@@ -82,6 +82,7 @@ def make_env(gym_id, seed):
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
         env = gym.wrappers.NormalizeReward(env)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -172,7 +173,7 @@ if __name__ == "__main__":
 
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset(seed=args.seed)[0]).to(device)
+    next_obs = torch.Tensor(envs.reset(seed=None)[0]).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
