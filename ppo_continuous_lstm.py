@@ -73,15 +73,18 @@ def parse_args():
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
 
-def make_env(gym_id, seed):
+def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
-        env = gym.make(gym_id)
+        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
         env = gym.wrappers.NormalizeReward(env)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -190,7 +193,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.gym_id, args.seed + i) for i in range(args.num_envs)]
+        [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -207,7 +210,7 @@ if __name__ == "__main__":
 
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset(seed=args.seed)[0]).to(device)
+    next_obs = torch.Tensor(envs.reset(seed=[args.seed + i for i in range(args.num_envs)])[0]).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     next_lstm_state = (
         torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
@@ -242,18 +245,17 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            # Iterate over each environment
-            for idx in range(args.num_envs):
-                # Check if 'final_info' is in 'info' and not None for this environment
-                if 'final_info' in info and info['final_info'][idx] is not None:
-                    final_info = info['final_info'][idx]
-                    if 'episode' in final_info:
-                        episode_info = final_info['episode']
-                        episodic_return = episode_info['r']
-                        episodic_length = episode_info['l']
-                        print(f"global_step={global_step}, episodic_return={episodic_return}")
-                        writer.add_scalar("charts/episodic_return", episodic_return, global_step)
-                        writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+            if 'final_info' in info:
+                final_info_array = np.array(info['final_info'])
+                valid_indices = np.where(final_info_array != None)[0]
+                valid_final_infos = final_info_array[valid_indices]
+                episodic_returns = np.array([entry['episode']['r'] for entry in valid_final_infos if 'episode' in entry])
+                episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
+                avg_return = np.round(np.mean(episodic_returns), 2)
+                avg_length = np.round(np.mean(episodic_lengths), 2)
+                print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                writer.add_scalar("charts/episodic_return", avg_return, global_step)
+                writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
         with torch.no_grad():
             next_value = agent.get_value(
@@ -370,5 +372,9 @@ if __name__ == "__main__":
         print(f"SPS: {int(global_step / (time.time() - start_time))}")
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+    if args.track and args.capture_video:
+        wandb.save(f"videos/{run_name}/*.mp4")
+        wandb.save(f"videos/{run_name}/*.json")
+    
     envs.close()
     writer.close()

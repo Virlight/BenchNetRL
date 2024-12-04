@@ -97,11 +97,12 @@ def parse_args():
 
 def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
-        env = gym.make(gym_id)
+        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
         env = RemoveMissionWrapper(env)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -257,7 +258,7 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs_raw = envs.reset(seed=args.seed)
+    next_obs_raw = torch.Tensor(envs.reset(seed=[args.seed + i for i in range(args.num_envs)])[0]).to(device)
     next_obs = {
         'image': torch.tensor(next_obs_raw['image']).to(device),
         'direction': torch.tensor(next_obs_raw['direction']).to(device),
@@ -328,14 +329,17 @@ if __name__ == "__main__":
                         'direction': next_obs['direction'][i].cpu().numpy(),
                     }] * sequence_length, maxlen=sequence_length)
 
-            # Log episodic returns
-            for idx, item in enumerate(info['final_info']):
-                if item is not None:
-                    episodic_return = item['episode']['r']
-                    episodic_length = item['episode']['l']
-                    print(f"global_step={global_step}, episodic_return={episodic_return}")
-                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
-                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+            if 'final_info' in info:
+                final_info_array = np.array(info['final_info'])
+                valid_indices = np.where(final_info_array != None)[0]
+                valid_final_infos = final_info_array[valid_indices]
+                episodic_returns = np.array([entry['episode']['r'] for entry in valid_final_infos if 'episode' in entry])
+                episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
+                avg_return = np.round(np.mean(episodic_returns), 2)
+                avg_length = np.round(np.mean(episodic_lengths), 2)
+                print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                writer.add_scalar("charts/episodic_return", avg_return, global_step)
+                writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
         # Bootstrap value if not done
         with torch.no_grad():
@@ -464,6 +468,10 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print(f"SPS: {int(global_step / (time.time() - start_time))}")
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if args.track and args.capture_video:
+        wandb.save(f"videos/{run_name}/*.mp4")
+        wandb.save(f"videos/{run_name}/*.json")
 
     envs.close()
     writer.close()
