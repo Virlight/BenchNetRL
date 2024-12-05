@@ -3,6 +3,7 @@ results/
 runs/
 wandb/
 videos/
+charts_episodic_return/
 
 #official python gitignore
 # Byte-compiled / optimized / DLL files
