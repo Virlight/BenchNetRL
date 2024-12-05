@@ -221,6 +221,16 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    # Count and log parameters after agent initialization
+    if args.track:
+        total_params = sum(p.numel() for p in agent.parameters())
+        trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
+        
+        wandb.config.update({
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params
+        }, allow_val_change=True)
+
     # Storage setup
     obs = {
         'image': torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space['image'].shape).to(device),
@@ -328,6 +338,17 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+
+        # Initialize accumulators for metrics
+        total_loss_list = []
+        pg_loss_list = []
+        v_loss_list = []
+        entropy_list = []
+        grad_norm_list = []
+        approx_kl_list = []
+        old_approx_kl_list = []
+        grad_norm_list = []
+
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -382,12 +403,31 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
+
+                # Append metrics for this minibatch
+                total_loss_list.append(loss.item())
+                pg_loss_list.append(pg_loss.item())
+                v_loss_list.append(v_loss.item())
+                entropy_list.append(entropy_loss.item())
+                grad_norm_list.append(grad_norm.item())
+                approx_kl_list.append(approx_kl.item())
+                old_approx_kl_list.append(old_approx_kl.item())
+                grad_norm_list.append(grad_norm.item())
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+        
+        # Compute means
+        avg_total_loss = np.mean(total_loss_list)
+        avg_pg_loss = np.mean(pg_loss_list)
+        avg_v_loss = np.mean(v_loss_list)
+        avg_entropy = np.mean(entropy_list)
+        avg_grad_norm = np.mean(grad_norm_list)
+        avg_approx_kl = np.mean(approx_kl_list)
+        avg_old_approx_kl = np.mean(old_approx_kl_list)
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -395,11 +435,13 @@ if __name__ == "__main__":
 
         # Record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("losses/total_loss", avg_total_loss, global_step)
+        writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
+        writer.add_scalar("losses/policy_loss", avg_pg_loss, global_step)
+        writer.add_scalar("losses/entropy", avg_entropy, global_step)
+        writer.add_scalar("losses/grad_norm", avg_grad_norm, global_step)
+        writer.add_scalar("losses/old_approx_kl", avg_old_approx_kl, global_step)
+        writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print(f"SPS: {int(global_step / (time.time() - start_time))}")
@@ -408,6 +450,10 @@ if __name__ == "__main__":
     if args.track and args.capture_video:
         wandb.save(f"videos/{run_name}/*.mp4")
         wandb.save(f"videos/{run_name}/*.json")
+        video_path = f"videos/{run_name}"
+        video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
+        for video_file in video_files:
+            wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
     
     envs.close()
     writer.close()
