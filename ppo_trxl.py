@@ -5,7 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 
 import gymnasium as gym
-import memory_gym
+#import memory_gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ import torch.optim as optim
 import tyro
 from einops import rearrange
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
-from pom_env import PoMEnv
+#from pom_env import PoMEnv
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
@@ -30,7 +30,7 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "ppo-minigrid"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
