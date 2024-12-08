@@ -7,6 +7,7 @@ charts_episodic_return/
 
 #official python gitignore
 # Byte-compiled / optimized / DLL files
+.vscode/
 __pycache__/
 *.py[cod]
 *$py.class

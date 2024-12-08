@@ -4,10 +4,10 @@ import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
 import minigrid
-import gym_minigrid
-from gym.spaces import Box, Discrete, Dict
+from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
+from gymnasium.spaces import Box, Discrete, Dict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,15 +17,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 class RemoveMissionWrapper(gym.ObservationWrapper):
     def __init__(self, env):
-        gym.ObservationWrapper.__init__(self, env)  # Explicitly call the base class's __init__
-        # Modify the observation space to exclude 'mission'
+        super().__init__(env)
         original_space = self.observation_space
-        self.observation_space = gym.spaces.Dict({
+        self.observation_space = Dict({
             k: v for k, v in original_space.spaces.items() if k != 'mission'
         })
-
     def observation(self, obs):
-        # Remove 'mission' from the observation
         return {k: v for k, v in obs.items() if k != 'mission'}
 
 def parse_args():
@@ -54,7 +51,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--num-envs", type=int, default=1,
+    parser.add_argument("--num-envs", type=int, default=8,
         help="the number of parallel game environments")
     parser.add_argument("--num-steps", type=int, default=128,
         help="the number of steps to run in each environment per policy rollout")
@@ -91,12 +88,15 @@ def parse_args():
 
 def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
-        for elem in gym.envs.registry.keys():
-            if 'MiniGrid' in elem:
-                #print(elem)
-                pass
-        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
+        env = gym.make(
+            gym_id,
+            agent_view_size=3,
+            tile_size=28,
+            render_mode="rgb_array" if capture_video else None,
+        )
+        env = RGBImgPartialObsWrapper(env, tile_size=28)
         env = RemoveMissionWrapper(env)
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=96)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -116,7 +116,7 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
         # Assuming observation space is Dict with keys 'image' and 'direction'
-        image_shape = envs.single_observation_space['image'].shape  # (7, 7, 3)
+        image_shape = envs.single_observation_space['image'].shape  # (28, 28, 3)
         direction_shape = envs.single_observation_space['direction'].n  # 4 directions
 
         self.image_conv = nn.Sequential(
@@ -152,11 +152,11 @@ class Agent(nn.Module):
         )
 
     def forward(self, obs):
-        image = obs['image']  # Tensor of shape (batch_size, 7, 7, 3)
+        image = obs['image']  # Tensor of shape (batch_size, 28, 28, 3)
         direction = obs['direction']  # Tensor of shape (batch_size,)
 
         # Process image
-        image = image.permute(0, 3, 1, 2)  # Convert to (batch_size, 3, 7, 7)
+        image = image.permute(0, 3, 1, 2)  # Convert to (batch_size, 3, 28, 28)
         image = image.float() / 255.0  # Normalize pixel values
         image_features = self.image_conv(image)  # (batch_size, cnn_output_size)
 
@@ -215,6 +215,8 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
+    print("Observation Space:", envs.single_observation_space)
+    print("Action Space:", envs.single_action_space)
     assert isinstance(envs.single_action_space, Discrete), "only discrete action space is supported"
     assert isinstance(envs.single_observation_space, Dict), "observation space must be Dict"
 
@@ -245,11 +247,10 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset(seed=[args.seed + i for i in range(args.num_envs)])[0]).to(device)
-    #print(next_obs)
+    next_obs_raw, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = {
-        'image': torch.tensor(next_obs[0]['image']).to(device),
-        'direction': torch.tensor(next_obs[0]['direction']).to(device),
+        'image': torch.tensor(next_obs_raw['image']).to(device),
+        'direction': torch.tensor(next_obs_raw['direction']).to(device),
     }
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
@@ -419,7 +420,7 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-        
+
         # Compute means
         avg_total_loss = np.mean(total_loss_list)
         avg_pg_loss = np.mean(pg_loss_list)
