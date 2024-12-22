@@ -1,131 +1,117 @@
+import argparse
 import os
 import random
 import time
 from collections import deque
-from dataclasses import dataclass
+from distutils.util import strtobool
 
 import gymnasium as gym
-#import memory_gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import tyro
 from einops import rearrange
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
-#from pom_env import PoMEnv
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-
-@dataclass
-class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
-    seed: int = 1
-    """seed of the experiment"""
-    torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
-    track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "ppo-minigrid"
-    """the wandb's project name"""
-    wandb_entity: str = None
-    """the entity (team) of wandb's project"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
+        help="the name of this experiment")
+    parser.add_argument("--gym-id", type=str, default="MiniGrid-DoorKey-16x16-v0",
+        help="the id of the gym environment")
+    parser.add_argument("--learning-rate", type=float, default=2.75e-4,
+        help="the initial learning rate of the optimizer")
+    parser.add_argument("--final-lr", type=float, default=1.0e-5,
+        help="the final learning rate after annealing")
+    parser.add_argument("--seed", type=int, default=1,
+        help="seed of the experiment")
+    parser.add_argument("--total-timesteps", type=int, default=100000000,
+        help="total timesteps of the experiments")
+    parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="if toggled, `torch.backends.cudnn.deterministic=False`")
+    parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="if toggled, cuda will be enabled by default")
+    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="if toggled, this experiment will be tracked with Weights and Biases")
+    parser.add_argument("--wandb-project-name", type=str, default="ppo-minigrid",
+        help="the wandb's project name")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+        help="the entity (team) of wandb's project")
+    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    env_id: str = "MortarMayhem-Grid-v0"
-    """the id of the environment"""
-    total_timesteps: int = 200000000
-    """total timesteps of the experiments"""
-    init_lr: float = 2.75e-4
-    """the initial learning rate of the optimizer"""
-    final_lr: float = 1.0e-5
-    """the final learning rate of the optimizer after linearly annealing"""
-    num_envs: int = 32
-    """the number of parallel game environments"""
-    num_steps: int = 512
-    """the number of steps to run in each environment per policy rollout"""
-    anneal_steps: int = 32 * 512 * 10000
-    """the number of steps to linearly anneal the learning rate and entropy coefficient from initial to final"""
-    gamma: float = 0.995
-    """the discount factor gamma"""
-    gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
-    num_minibatches: int = 8
-    """the number of mini-batches"""
-    update_epochs: int = 3
-    """the K epochs to update the policy"""
-    norm_adv: bool = False
-    """Toggles advantages normalization"""
-    clip_coef: float = 0.1
-    """the surrogate clipping coefficient"""
-    clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    init_ent_coef: float = 0.0001
-    """initial coefficient of the entropy bonus"""
-    final_ent_coef: float = 0.000001
-    """final coefficient of the entropy bonus after linearly annealing"""
-    vf_coef: float = 0.5
-    """coefficient of the value function"""
-    max_grad_norm: float = 0.25
-    """the maximum norm for the gradient clipping"""
-    target_kl: float = None
-    """the target KL divergence threshold"""
+    parser.add_argument("--num-envs", type=int, default=32,
+        help="the number of parallel game environments")
+    parser.add_argument("--num-steps", type=int, default=512,
+        help="the number of steps to run in each environment per policy rollout")
+    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="Toggle learning rate annealing for policy and value networks")
+    parser.add_argument("--gamma", type=float, default=0.995,
+        help="the discount factor gamma")
+    parser.add_argument("--gae-lambda", type=float, default=0.95,
+        help="the lambda for the general advantage estimation")
+    parser.add_argument("--num-minibatches", type=int, default=8,
+        help="the number of mini-batches")
+    parser.add_argument("--update-epochs", type=int, default=3,
+        help="the K epochs to update the policy")
+    parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="Toggles advantages normalization")
+    parser.add_argument("--clip-coef", type=float, default=0.1,
+        help="the surrogate clipping coefficient")
+    parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="use a clipped loss for the value function")
+    parser.add_argument("--init-ent-coef", type=float, default=0.0001,
+        help="initial entropy coefficient")
+    parser.add_argument("--final-ent-coef", type=float, default=0.000001,
+        help="final entropy coefficient after annealing")
+    parser.add_argument("--vf-coef", type=float, default=0.5,
+        help="coefficient of the value function")
+    parser.add_argument("--max-grad-norm", type=float, default=0.25,
+        help="the maximum norm for the gradient clipping")
+    parser.add_argument("--target-kl", type=float, default=None,
+        help="the target KL divergence threshold")
 
-    # Transformer-XL specific arguments
-    trxl_num_layers: int = 3
-    """the number of transformer layers"""
-    trxl_num_heads: int = 4
-    """the number of heads used in multi-head attention"""
-    trxl_dim: int = 384
-    """the dimension of the transformer"""
-    trxl_memory_length: int = 119
-    """the length of TrXL's sliding memory window"""
-    trxl_positional_encoding: str = "absolute"
-    """the positional encoding type of the transformer, choices: "", "absolute", "learned" """
-    reconstruction_coef: float = 0.0
-    """the coefficient of the observation reconstruction loss, if set to 0.0 the reconstruction loss is not used"""
+    # Additional arguments for transformer
+    parser.add_argument("--trxl-num-layers", type=int, default=3,
+        help="the number of transformer layers")
+    parser.add_argument("--trxl-num-heads", type=int, default=4,
+        help="the number of heads used in multi-head attention")
+    parser.add_argument("--trxl-dim", type=int, default=384,
+        help="the dimension of the transformer")
+    parser.add_argument("--trxl-memory-length", type=int, default=119,
+        help="the length of TrXL's sliding memory window")
+    parser.add_argument("--trxl-positional-encoding", type=str, default="absolute",
+        help='the positional encoding type: "", "absolute", "learned"')
+    parser.add_argument("--reconstruction-coef", type=float, default=0.0,
+        help="the coefficient of the observation reconstruction loss")
 
-    # To be filled on runtime
-    batch_size: int = 0
-    """the batch size (computed in runtime)"""
-    minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
-    num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
+    args = parser.parse_args()
+    args.batch_size = int(args.num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    args.num_iterations = args.total_timesteps // args.batch_size
+    return args
 
-
-def make_env(env_id, idx, capture_video, run_name, render_mode="debug_rgb_array"):
-    if "MiniGrid" in env_id:
-        if render_mode == "debug_rgb_array":
-            render_mode = "rgb_array"
-
+def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
-        if "MiniGrid" in env_id:
-            env = gym.make(env_id, agent_view_size=3, tile_size=28, render_mode=render_mode)
-            env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=28))
-            env = gym.wrappers.TimeLimit(env, 96)
-        else:
-            env = gym.make(env_id, render_mode=render_mode)
+        env = gym.make(env_id, agent_view_size=3, tile_size=28,
+                       render_mode="rgb_array" if capture_video else None)
+        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=28))
+        env = gym.wrappers.TimeLimit(env, 96)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        return gym.wrappers.RecordEpisodeStatistics(env)
-
+        env.reset(seed=seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        return env
     return thunk
-
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
-    # torch.nn.init.constant_(layer.bias, bias_const)
     return layer
-
 
 def batched_index_select(input, dim, index):
     for ii in range(1, len(input.shape)):
@@ -136,7 +122,6 @@ def batched_index_select(input, dim, index):
     expanse[dim] = -1
     index = index.expand(expanse)
     return torch.gather(input, dim, index)
-
 
 class PositionalEncoding(nn.Module):
     def __init__(self, dim, min_timescale=2.0, max_timescale=1e4):
@@ -151,17 +136,14 @@ class PositionalEncoding(nn.Module):
         pos_emb = torch.cat((sinusoidal_inp.sin(), sinusoidal_inp.cos()), dim=-1)
         return pos_emb
 
-
 class MultiHeadAttention(nn.Module):
-    """Multi Head Attention without dropout inspired by https://github.com/aladdinpersson/Machine-Learning-Collection"""
-
     def __init__(self, embed_dim, num_heads):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_size = embed_dim // num_heads
 
-        assert self.head_size * num_heads == embed_dim, "Embedding dimension needs to be divisible by the number of heads"
+        assert self.head_size * num_heads == embed_dim, "Embedding dimension must be divisible by num_heads"
 
         self.values = nn.Linear(self.head_size, self.head_size, bias=False)
         self.keys = nn.Linear(self.head_size, self.head_size, bias=False)
@@ -176,27 +158,18 @@ class MultiHeadAttention(nn.Module):
         keys = keys.reshape(N, key_len, self.num_heads, self.head_size)
         query = query.reshape(N, query_len, self.num_heads, self.head_size)
 
-        values = self.values(values)  # (N, value_len, heads, head_dim)
-        keys = self.keys(keys)  # (N, key_len, heads, head_dim)
-        queries = self.queries(query)  # (N, query_len, heads, heads_dim)
+        values = self.values(values)
+        keys = self.keys(keys)
+        queries = self.queries(query)
 
-        # Dot-product
         energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
 
-        # Mask padded indices so their attention weights become 0
         if mask is not None:
-            energy = energy.masked_fill(mask.unsqueeze(1).unsqueeze(1) == 0, float("-1e20"))  # -inf causes NaN
+            energy = energy.masked_fill(mask.unsqueeze(1).unsqueeze(1) == 0, float("-1e20"))
 
-        # Normalize energy values and apply softmax to retrieve the attention scores
-        attention = torch.softmax(
-            energy / (self.embed_dim ** (1 / 2)), dim=3
-        )  # attention shape: (N, heads, query_len, key_len)
-
-        # Scale values by attention weights
+        attention = torch.softmax(energy / (self.embed_dim ** (1 / 2)), dim=3)
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(N, query_len, self.num_heads * self.head_size)
-
         return self.fc_out(out), attention
-
 
 class TransformerLayer(nn.Module):
     def __init__(self, dim, num_heads):
@@ -208,17 +181,15 @@ class TransformerLayer(nn.Module):
         self.fc_projection = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
 
     def forward(self, value, key, query, mask):
-        # Pre-layer normalization (post-layer normalization is usually less effective)
         query_ = self.layer_norm_q(query)
         value = self.norm_kv(value)
-        key = value  # K = V -> self-attention
-        attention, attention_weights = self.attention(value, key, query_, mask)  # MHA
-        x = attention + query  # Skip connection
-        x_ = self.layer_norm_attn(x)  # Pre-layer normalization
-        forward = self.fc_projection(x_)  # Forward projection
-        out = forward + x  # Skip connection
+        key = value
+        attention, attention_weights = self.attention(value, key, query_, mask)
+        x = attention + query
+        x_ = self.layer_norm_attn(x)
+        forward = self.fc_projection(x_)
+        out = forward + x
         return out, attention_weights
-
 
 class Transformer(nn.Module):
     def __init__(self, num_layers, dim, num_heads, max_episode_steps, positional_encoding):
@@ -232,25 +203,22 @@ class Transformer(nn.Module):
         self.transformer_layers = nn.ModuleList([TransformerLayer(dim, num_heads) for _ in range(num_layers)])
 
     def forward(self, x, memories, mask, memory_indices):
-        # Add positional encoding to every transformer layer input
         if self.positional_encoding == "absolute":
             pos_embedding = self.pos_embedding(self.max_episode_steps)[memory_indices]
             memories = memories + pos_embedding.unsqueeze(2)
         elif self.positional_encoding == "learned":
             memories = memories + self.pos_embedding[memory_indices].unsqueeze(2)
 
-        # Forward transformer layers and return new memories (i.e. hidden states)
         out_memories = []
         for i, layer in enumerate(self.transformer_layers):
             out_memories.append(x.detach())
             x, attention_weights = layer(
                 memories[:, :, i], memories[:, :, i], x.unsqueeze(1), mask
-            )  # args: value, key, query, mask
+            )
             x = x.squeeze()
             if len(x.shape) == 1:
                 x = x.unsqueeze(0)
         return x, torch.stack(out_memories, dim=1)
-
 
 class Agent(nn.Module):
     def __init__(self, args, observation_space, action_space_shape, max_episode_steps):
@@ -290,7 +258,8 @@ class Agent(nn.Module):
         )
         self.critic = layer_init(nn.Linear(args.trxl_dim, 1), 1)
 
-        if args.reconstruction_coef > 0.0:
+        self.reconstruction_coef = args.reconstruction_coef
+        if self.reconstruction_coef > 0.0:
             self.transposed_cnn = nn.Sequential(
                 layer_init(nn.Linear(args.trxl_dim, 64 * 7 * 7)),
                 nn.ReLU(),
@@ -323,9 +292,7 @@ class Agent(nn.Module):
         probs = [Categorical(logits=branch(x)) for branch in self.actor_branches]
         if action is None:
             action = torch.stack([dist.sample() for dist in probs], dim=1)
-        log_probs = []
-        for i, dist in enumerate(probs):
-            log_probs.append(dist.log_prob(action[:, i]))
+        log_probs = [dist.log_prob(action[:, i]) for i, dist in enumerate(probs)]
         entropies = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(-1)
         return action, torch.stack(log_probs, dim=1), entropies, self.critic(x).flatten(), memory
 
@@ -333,17 +300,11 @@ class Agent(nn.Module):
         x = self.transposed_cnn(self.x)
         return x.permute((0, 2, 3, 1))
 
-
 if __name__ == "__main__":
-    args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-
+    args = parse_args()
+    run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -359,174 +320,152 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
+    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    # Determine the device to be used for training and set the default tensor type
-    if args.cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        torch.set_default_device(device)
-    else:
-        device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    torch.set_default_device(device)
 
-    # Environment setup
+    # Env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     observation_space = envs.single_observation_space
-    action_space_shape = (
-        (envs.single_action_space.n,)
-        if isinstance(envs.single_action_space, gym.spaces.Discrete)
-        else tuple(envs.single_action_space.nvec)
-    )
-    env_ids = range(args.num_envs)
+    action_space_shape = ((envs.single_action_space.n,) if isinstance(envs.single_action_space, gym.spaces.Discrete)
+                          else tuple(envs.single_action_space.nvec))
+
     env_current_episode_step = torch.zeros((args.num_envs,), dtype=torch.long)
-    # Determine maximum episode steps
     max_episode_steps = envs.envs[0].spec.max_episode_steps
     if not max_episode_steps:
-        envs.envs[0].reset()  # Memory Gym envs need to be reset before accessing max_episode_steps
+        envs.envs[0].reset()
         max_episode_steps = envs.envs[0].max_episode_steps
     if max_episode_steps <= 0:
-        max_episode_steps = 1024  # Memory Gym envs have max_episode_steps set to -1
-    # Set transformer memory length to max episode steps if greater than max episode steps
+        max_episode_steps = 1024
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
 
     agent = Agent(args, observation_space, action_space_shape, max_episode_steps).to(device)
-    optimizer = optim.AdamW(agent.parameters(), lr=args.init_lr)
-    bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
+    optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate)
+    bce_loss = nn.BCELoss()
 
-    # ALGO Logic: Storage setup
+    # Count and log parameters after agent initialization
+    if args.track:
+        total_params = sum(p.numel() for p in agent.parameters())
+        trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
+        import wandb
+        wandb.config.update({
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params
+        }, allow_val_change=True)
+
+    # Storage setup
     rewards = torch.zeros((args.num_steps, args.num_envs))
     actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long)
     dones = torch.zeros((args.num_steps, args.num_envs))
     obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape)
     log_probs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)))
     values = torch.zeros((args.num_steps, args.num_envs))
-    # The length of stored-memories is equal to the number of sampled episodes during training data sampling
-    # (num_episodes, max_episode_length, num_layers, embed_dim)
     stored_memories = []
-    # Memory mask used during attention
     stored_memory_masks = torch.zeros((args.num_steps, args.num_envs, args.trxl_memory_length), dtype=torch.bool)
-    # Index to select the correct episode memory from stored_memories
     stored_memory_index = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long)
-    # Indices to slice the episode memories into windows
     stored_memory_indices = torch.zeros((args.num_steps, args.num_envs, args.trxl_memory_length), dtype=torch.long)
 
-    # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    episode_infos = deque(maxlen=100)  # Store episode results for monitoring statistics
-    next_obs, _ = envs.reset(seed=args.seed)
+    episode_infos = deque(maxlen=100)
+    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs)
-    # Setup placeholders for each environments's current episodic memory
     next_memory = torch.zeros((args.num_envs, max_episode_steps, args.trxl_num_layers, args.trxl_dim), dtype=torch.float32)
-    # Generate episodic memory mask used in attention
     memory_mask = torch.tril(torch.ones((args.trxl_memory_length, args.trxl_memory_length)), diagonal=-1)
-    """ e.g. memory mask tensor looks like this if memory_length = 6
-    0, 0, 0, 0, 0, 0
-    1, 0, 0, 0, 0, 0
-    1, 1, 0, 0, 0, 0
-    1, 1, 1, 0, 0, 0
-    1, 1, 1, 1, 0, 0
-    1, 1, 1, 1, 1, 0
-    """
-    # Setup memory window indices to support a sliding window over the episodic memory
-    repetitions = torch.repeat_interleave(
+
+    # Indices for memory
+    from_indices = torch.repeat_interleave(
         torch.arange(0, args.trxl_memory_length).unsqueeze(0), args.trxl_memory_length - 1, dim=0
     ).long()
-    memory_indices = torch.stack(
+    to_indices = torch.stack(
         [torch.arange(i, i + args.trxl_memory_length) for i in range(max_episode_steps - args.trxl_memory_length + 1)]
     ).long()
-    memory_indices = torch.cat((repetitions, memory_indices))
-    """ e.g. the memory window indices tensor looks like this if memory_length = 4 and max_episode_length = 7:
-    0, 1, 2, 3
-    0, 1, 2, 3
-    0, 1, 2, 3
-    0, 1, 2, 3
-    1, 2, 3, 4
-    2, 3, 4, 5
-    3, 4, 5, 6
-    """
+    memory_indices = torch.cat((from_indices, to_indices))
 
     for iteration in range(1, args.num_iterations + 1):
         sampled_episode_infos = []
-
-        # Annealing the learning rate and entropy coefficient if instructed to do so
-        do_anneal = args.anneal_steps > 0 and global_step < args.anneal_steps
-        frac = 1 - global_step / args.anneal_steps if do_anneal else 0
-        lr = (args.init_lr - args.final_lr) * frac + args.final_lr
+        do_anneal = args.anneal_lr and (args.total_timesteps > 0)  # or your own logic
+        steps_to_anneal = args.num_iterations * args.batch_size if not hasattr(args, "anneal_steps") else args.anneal_steps
+        if steps_to_anneal <= 0:
+            steps_to_anneal = args.num_iterations * args.batch_size
+        frac = 1 - global_step / steps_to_anneal if do_anneal and global_step < steps_to_anneal else 0
+        lr = (args.learning_rate - args.final_lr) * frac + args.final_lr
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         ent_coef = (args.init_ent_coef - args.final_ent_coef) * frac + args.final_ent_coef
 
-        # Init episodic memory buffer using each environments' current episodic memory
+        # Prepare current environment memory references
         stored_memories = [next_memory[e] for e in range(args.num_envs)]
         for e in range(args.num_envs):
             stored_memory_index[:, e] = e
 
         for step in range(args.num_steps):
             global_step += args.num_envs
+            obs[step] = next_obs
+            dones[step] = next_done
+            stored_memory_masks[step] = memory_mask[torch.clip(env_current_episode_step, 0, args.trxl_memory_length - 1)]
+            stored_memory_indices[step] = memory_indices[env_current_episode_step]
 
-            # ALGO LOGIC: action logic
             with torch.no_grad():
-                obs[step] = next_obs
-                dones[step] = next_done
-                stored_memory_masks[step] = memory_mask[torch.clip(env_current_episode_step, 0, args.trxl_memory_length - 1)]
-                stored_memory_indices[step] = memory_indices[env_current_episode_step]
-                # Retrieve the memory window from the entire episodic memory
                 memory_window = batched_index_select(next_memory, 1, stored_memory_indices[step])
                 action, logprob, _, value, new_memory = agent.get_action_and_value(
                     next_obs, memory_window, stored_memory_masks[step], stored_memory_indices[step]
                 )
-                next_memory[env_ids, env_current_episode_step] = new_memory
-                # Store the action, log_prob, and value in the buffer
+                next_memory[torch.arange(args.num_envs), env_current_episode_step] = new_memory
                 actions[step], log_probs[step], values[step] = action, logprob, value
 
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            # Step environment
+            next_obs_, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            next_obs = torch.Tensor(next_obs_).to(device)
+            next_done = torch.Tensor(next_done).to(device)
 
-            # Reset and process episodic memory if done
-            for id, done in enumerate(next_done):
-                if done:
-                    # Reset the environment's current timestep
-                    env_current_episode_step[id] = 0
-                    # Break the reference to the environment's episodic memory
-                    mem_index = stored_memory_index[step, id]
+            # If done, reset environment memory
+            for idx, d in enumerate(next_done):
+                if d:
+                    env_current_episode_step[idx] = 0
+                    mem_index = stored_memory_index[step, idx]
                     stored_memories[mem_index] = stored_memories[mem_index].clone()
-                    # Reset episodic memory
-                    next_memory[id] = torch.zeros(
+                    next_memory[idx] = torch.zeros(
                         (max_episode_steps, args.trxl_num_layers, args.trxl_dim), dtype=torch.float32
                     )
                     if step < args.num_steps - 1:
-                        # Store memory inside the buffer
-                        stored_memories.append(next_memory[id])
-                        # Store the reference of to the current episodic memory inside the buffer
-                        stored_memory_index[step + 1 :, id] = len(stored_memories) - 1
+                        stored_memories.append(next_memory[idx])
+                        stored_memory_index[step + 1:, idx] = len(stored_memories) - 1
                 else:
-                    # Increment environment timestep if not done
-                    env_current_episode_step[id] += 1
+                    env_current_episode_step[idx] += 1
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        sampled_episode_infos.append(info["episode"])
+            # This final_info block is adapted to match ppo-mlp style
+            if 'final_info' in infos:
+                final_info_array = np.array(infos['final_info'])
+                valid_indices = np.where(final_info_array != None)[0]
+                valid_final_infos = final_info_array[valid_indices]
+                episodic_returns = np.array([entry['episode']['r'] for entry in valid_final_infos if 'episode' in entry])
+                episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
+                if len(episodic_returns) > 0:  # to avoid issues with empty arrays
+                    avg_return = np.round(np.mean(episodic_returns), 2)
+                    avg_length = np.round(np.mean(episodic_lengths), 2)
+                    print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                    writer.add_scalar("charts/episodic_return", avg_return, global_step)
+                    writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
-        # Bootstrap value if not done
+        # Bootstrap value
         with torch.no_grad():
-            start = torch.clip(env_current_episode_step - args.trxl_memory_length, 0)
-            end = torch.clip(env_current_episode_step, args.trxl_memory_length)
-            indices = torch.stack([torch.arange(start[b], end[b]) for b in range(args.num_envs)]).long()
-            memory_window = batched_index_select(next_memory, 1, indices)  # Retrieve the memory window from the entire episode
+            start_idx = torch.clip(env_current_episode_step - args.trxl_memory_length, 0)
+            end_idx = torch.clip(env_current_episode_step, args.trxl_memory_length)
+            indices = torch.stack([torch.arange(start_idx[b], end_idx[b]) for b in range(args.num_envs)]).long()
+            memory_window = batched_index_select(next_memory, 1, indices)
             next_value = agent.get_value(
-                next_obs,
-                memory_window,
+                next_obs, memory_window,
                 memory_mask[torch.clip(env_current_episode_step, 0, args.trxl_memory_length - 1)],
                 stored_memory_indices[-1],
             )
@@ -543,7 +482,7 @@ if __name__ == "__main__":
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-        # Flatten the batch
+        # Flatten
         b_obs = obs.reshape(-1, *obs.shape[2:])
         b_logprobs = log_probs.reshape(-1, *log_probs.shape[2:])
         b_actions = actions.reshape(-1, *actions.shape[2:])
@@ -555,15 +494,22 @@ if __name__ == "__main__":
         b_memory_mask = stored_memory_masks.reshape(-1, *stored_memory_masks.shape[2:])
         stored_memories = torch.stack(stored_memories, dim=0)
 
-        # Remove unnecessary padding from TrXL memory, if applicable
         actual_max_episode_steps = (stored_memory_indices * stored_memory_masks).max().item() + 1
         if actual_max_episode_steps < args.trxl_memory_length:
             b_memory_indices = b_memory_indices[:, :actual_max_episode_steps]
             b_memory_mask = b_memory_mask[:, :actual_max_episode_steps]
             stored_memories = stored_memories[:, :actual_max_episode_steps]
 
-        # Optimizing the policy and value network
+        # Training
         clipfracs = []
+        total_loss_list = []
+        pg_loss_list = []
+        v_loss_list = []
+        entropy_list = []
+        grad_norm_list = []
+        approx_kl_list = []
+        old_approx_kl_list = []
+
         for epoch in range(args.update_epochs):
             b_inds = torch.randperm(args.batch_size)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -576,107 +522,95 @@ if __name__ == "__main__":
                     b_obs[mb_inds], mb_memory_windows, b_memory_mask[mb_inds], b_memory_indices[mb_inds], b_actions[mb_inds]
                 )
 
-                # Policy loss
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                mb_advantages = mb_advantages.unsqueeze(1).repeat(
-                    1, len(action_space_shape)
-                )  # Repeat is necessary for multi-discrete action spaces
+                mb_advantages = mb_advantages.unsqueeze(1).repeat(1, len(action_space_shape))
+
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = torch.exp(logratio)
                 pgloss1 = -mb_advantages * ratio
                 pgloss2 = -mb_advantages * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
                 pg_loss = torch.max(pgloss1, pgloss2).mean()
 
-                # Value loss
-                v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_clipped = b_values[mb_inds] + (newvalue - b_values[mb_inds]).clamp(
-                        min=-args.clip_coef, max=args.clip_coef
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + (newvalue - b_values[mb_inds]).clamp(
+                        -args.clip_coef, args.clip_coef
                     )
-                    v_loss = torch.max(v_loss_unclipped, (v_loss_clipped - b_returns[mb_inds]) ** 2).mean()
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
                 else:
-                    v_loss = v_loss_unclipped.mean()
+                    v_loss = ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                # Entropy loss
                 entropy_loss = entropy.mean()
-
-                # Combined losses
                 loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                # Add reconstruction loss if used
+                # Reconstruction
                 r_loss = torch.tensor(0.0)
-                if args.reconstruction_coef > 0.0:
+                if agent.reconstruction_coef > 0.0:
                     r_loss = bce_loss(agent.reconstruct_observation(), b_obs[mb_inds] / 255.0)
-                    loss += args.reconstruction_coef * r_loss
+                    loss += agent.reconstruction_coef * r_loss
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=args.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
+                total_loss_list.append(loss.item())
+                pg_loss_list.append(pg_loss.item())
+                v_loss_list.append(v_loss.item())
+                entropy_list.append(entropy_loss.item())
+                grad_norm_list.append(grad_norm.item())
+                approx_kl_list.append(approx_kl.item())
+                old_approx_kl_list.append(old_approx_kl.item())
+
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
+
+        avg_total_loss = np.mean(total_loss_list)
+        avg_pg_loss = np.mean(pg_loss_list)
+        avg_v_loss = np.mean(v_loss_list)
+        avg_entropy = np.mean(entropy_list)
+        avg_grad_norm = np.mean(grad_norm_list)
+        avg_approx_kl = np.mean(approx_kl_list)
+        avg_old_approx_kl = np.mean(old_approx_kl_list)
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # Log and monitor training statistics
-        episode_infos.extend(sampled_episode_infos)
-        episode_result = {}
-        if len(episode_infos) > 0:
-            for key in episode_infos[0].keys():
-                episode_result[key + "_mean"] = np.mean([info[key] for info in episode_infos])
-
-        print(
-            "{:9} SPS={:4} return={:.2f} length={:.1f} pi_loss={:.3f} v_loss={:.3f} entropy={:.3f} r_loss={:.3f} value={:.3f} adv={:.3f}".format(
-                iteration,
-                int(global_step / (time.time() - start_time)),
-                episode_result["r_mean"],
-                episode_result["l_mean"],
-                pg_loss.item(),
-                v_loss.item(),
-                entropy_loss.item(),
-                r_loss.item(),
-                torch.mean(values),
-                torch.mean(advantages),
-            )
-        )
-
-        if episode_result:
-            for key in episode_result:
-                writer.add_scalar("episode/" + key, episode_result[key], global_step)
-        writer.add_scalar("episode/value_mean", torch.mean(values), global_step)
-        writer.add_scalar("episode/advantage_mean", torch.mean(advantages), global_step)
-        writer.add_scalar("charts/learning_rate", lr, global_step)
-        writer.add_scalar("charts/entropy_coefficient", ent_coef, global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/loss", loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/reconstruction_loss", r_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        # Standard logs
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/total_loss", avg_total_loss, global_step)
+        writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
+        writer.add_scalar("losses/policy_loss", avg_pg_loss, global_step)
+        writer.add_scalar("losses/entropy", avg_entropy, global_step)
+        writer.add_scalar("losses/grad_norm", avg_grad_norm, global_step)
+        writer.add_scalar("losses/old_approx_kl", avg_old_approx_kl, global_step)
+        writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-    if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        model_data = {
-            "model_weights": agent.state_dict(),
-            "args": vars(args),
-        }
-        torch.save(model_data, model_path)
-        print(f"model saved to {model_path}")
+        sps = int(global_step / (time.time() - start_time))
+        print("SPS:", sps)
+        writer.add_scalar("charts/SPS", sps, global_step)
+
+    # Optional: save videos
+    if args.track and args.capture_video:
+        import wandb
+        wandb.save(f"videos/{run_name}/*.mp4")
+        wandb.save(f"videos/{run_name}/*.json")
+        video_path = f"videos/{run_name}"
+        video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
+        for video_file in video_files:
+            wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
 
     writer.close()
     envs.close()
