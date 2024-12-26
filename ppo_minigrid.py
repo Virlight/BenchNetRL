@@ -7,23 +7,12 @@ from distutils.util import strtobool
 import gymnasium as gym
 import minigrid
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
-from gymnasium.spaces import Box, Discrete, Dict
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-
-class RemoveMissionWrapper(gym.ObservationWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        original_space = self.observation_space
-        self.observation_space = Dict({
-            k: v for k, v in original_space.spaces.items() if k != 'mission'
-        })
-    def observation(self, obs):
-        return {k: v for k, v in obs.items() if k != 'mission'}
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -35,7 +24,7 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
-    parser.add_argument("--total-timesteps", type=int, default=5000000,
+    parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
     parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
@@ -94,8 +83,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
             tile_size=28,
             render_mode="rgb_array" if capture_video else None,
         )
-        env = RGBImgPartialObsWrapper(env, tile_size=28)
-        env = RemoveMissionWrapper(env)
+        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=28))
         env = gym.wrappers.TimeLimit(env, max_episode_steps=96)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
@@ -112,80 +100,52 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
         torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
+
 class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
-        # Assuming observation space is Dict with keys 'image' and 'direction'
-        image_shape = envs.single_observation_space['image'].shape  # (28, 28, 3)
-        direction_shape = envs.single_observation_space['direction'].n  # 4 directions
-
-        self.image_conv = nn.Sequential(
-            layer_init(nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)),
+        self.network = nn.Sequential(
+            layer_init(nn.Conv2d(3, 32, 8, stride=4)),
             nn.ReLU(),
-            layer_init(nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
             nn.ReLU(),
             nn.Flatten(),
-        )
-
-        # Calculate the size of the CNN output
-        with torch.no_grad():
-            sample_input = torch.zeros(1, 3, image_shape[0], image_shape[1])
-            cnn_output_size = self.image_conv(sample_input).shape[1]
-
-        self.direction_embedding = nn.Embedding(direction_shape, 32)
-
-        self.fc = nn.Sequential(
-            layer_init(nn.Linear(cnn_output_size + 32, 256)),
+            layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
 
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(512, 256)),
             nn.ReLU(),
             layer_init(nn.Linear(256, 1), std=1.0),
         )
 
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(512, 256)),
             nn.ReLU(),
             layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01),
         )
 
-    def forward(self, obs):
-        image = obs['image']  # Tensor of shape (batch_size, 28, 28, 3)
-        direction = obs['direction']  # Tensor of shape (batch_size,)
-
-        # Process image
-        image = image.permute(0, 3, 1, 2)  # Convert to (batch_size, 3, 28, 28)
-        image = image.float() / 255.0  # Normalize pixel values
-        image_features = self.image_conv(image)  # (batch_size, cnn_output_size)
-
-        # Process direction
-        direction_embed = self.direction_embedding(direction)  # (batch_size, 32)
-
-        # Combine features
-        features = torch.cat([image_features, direction_embed], dim=1)  # (batch_size, cnn_output_size + 32)
-        hidden = self.fc(features)
-        return hidden
-
-    def get_value(self, obs):
-        hidden = self.forward(obs)
+    def get_value(self, x):
+        hidden = self.network(x.permute((0, 3, 1, 2)) / 255.0)
         return self.critic(hidden)
 
-    def get_action_and_value(self, obs, action=None):
-        hidden = self.forward(obs)
+    def get_action_and_value(self, x, action=None):
+        hidden = self.network(x.permute((0, 3, 1, 2)) / 255.0)
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
+
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -215,10 +175,7 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
-    print("Observation Space:", envs.single_observation_space)
-    print("Action Space:", envs.single_action_space)
-    assert isinstance(envs.single_action_space, Discrete), "only discrete action space is supported"
-    assert isinstance(envs.single_observation_space, Dict), "observation space must be Dict"
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -234,11 +191,8 @@ if __name__ == "__main__":
         }, allow_val_change=True)
 
     # Storage setup
-    obs = {
-        'image': torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space['image'].shape).to(device),
-        'direction': torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device),
-    }
-    actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -247,11 +201,8 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs_raw, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
-    next_obs = {
-        'image': torch.tensor(next_obs_raw['image']).to(device),
-        'direction': torch.tensor(next_obs_raw['direction']).to(device),
-    }
+    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
+    next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
@@ -264,8 +215,7 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            obs['image'][step] = next_obs['image']
-            obs['direction'][step] = next_obs['direction']
+            obs[step] = next_obs
             dones[step] = next_done
 
             # Action logic
@@ -276,14 +226,11 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # Execute the game and log data
-            next_obs_raw, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+            next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs = {
-                'image': torch.tensor(next_obs_raw['image']).to(device),
-                'direction': torch.tensor(next_obs_raw['direction']).to(device),
-            }
-            next_done = torch.tensor(done, dtype=torch.float32).to(device)
+            next_obs = torch.Tensor(next_obs).to(device)
+            next_done = torch.Tensor(done).to(device)
 
             if 'final_info' in info:
                 final_info_array = np.array(info['final_info'])
@@ -297,7 +244,7 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_return", avg_return, global_step)
                 writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
-        # Bootstrap value if not done
+        # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             if args.gae:
@@ -326,12 +273,9 @@ if __name__ == "__main__":
                 advantages = returns - values
 
         # Flatten the batch
-        b_obs = {
-            'image': obs['image'].reshape((-1,) + envs.single_observation_space['image'].shape),
-            'direction': obs['direction'].reshape(-1),
-        }
+        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape(-1)
+        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -356,26 +300,17 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                mb_obs = {
-                    'image': b_obs['image'][mb_inds],
-                    'direction': b_obs['direction'][mb_inds],
-                }
-                mb_actions = b_actions[mb_inds]
-                mb_logprobs = b_logprobs[mb_inds]
-                mb_advantages = b_advantages[mb_inds]
-                mb_returns = b_returns[mb_inds]
-                mb_values = b_values[mb_inds]
-
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions)
-                logratio = newlogprob - mb_logprobs
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # Calculate approx_kl
+                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
+                mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
@@ -387,20 +322,21 @@ if __name__ == "__main__":
                 # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - mb_returns) ** 2
-                    v_clipped = mb_values + torch.clamp(
-                        newvalue - mb_values,
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds],
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - mb_returns) ** 2
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -445,7 +381,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print(f"SPS: {int(global_step / (time.time() - start_time))}")
+        print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     if args.track and args.capture_video:
