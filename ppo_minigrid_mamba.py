@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from einops import rearrange
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
@@ -86,10 +85,10 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         env = gym.make(
             gym_id,
             agent_view_size=3,
-            tile_size=28,
+            tile_size=16,
             render_mode="rgb_array" if capture_video else None,
         )
-        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=28))
+        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=16))
         env = gym.wrappers.TimeLimit(env, 96)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
@@ -107,34 +106,22 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class Agent(nn.Module):
-    def __init__(self, args, observation_space, action_space_shape):
+    def __init__(self, envs):
         super().__init__()
-        self.seq_len = args.seq_len           # how many recent frames to feed Mamba
-        self.obs_shape = observation_space.shape
         d_model = 128                         # embedding dimension for Mamba
         d_state = 16                          # how large the Mamba internal dimension is
-        self.image_input = (len(self.obs_shape) == 3)  # True if shape like (H,W,3)
-
-        # 1) Encoder
-        if self.image_input:
-            # E.g. for (28,28,3) shapes
-            self.encoder = nn.Sequential(
-                layer_init(nn.Conv2d(3, 32, 8, stride=4)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-                nn.ReLU(),
-                nn.Flatten(),
-                layer_init(nn.Linear(64 * 7 * 7, d_model)),
-                nn.ReLU(),
-            )
-        else:
-            in_dim = np.prod(self.obs_shape)
-            self.encoder = nn.Sequential(
-                layer_init(nn.Linear(in_dim, d_model)),
-                nn.ReLU(),
-            )
+        # E.g. for (28,28,3) shapes
+        self.network = nn.Sequential(
+            layer_init(nn.Conv2d(3, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(256, d_model)),
+            nn.ReLU(),
+        )
 
         # 2) Mamba: the sequence block
         #    The model dimension is d_model, plus an internal 'state' dimension
@@ -153,64 +140,46 @@ class Agent(nn.Module):
         )
 
         # 4) Actor & Critic
-        self.actor_branches = nn.ModuleList([
-            layer_init(nn.Linear(d_model, num_actions), std=np.sqrt(0.01))
-            for num_actions in action_space_shape
-        ])
+        self.actor = layer_init(nn.Linear(d_model, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
 
-    def encode_obs(self, obs):
-        """
-        obs: tensor of shape (B, *obs_shape), e.g. (B, 28,28,3)
-        returns: (B, d_model)
-        """
-        if self.image_input:
-            # (B,H,W,C) -> (B,C,H,W)
-            return self.encoder(obs.permute(0, 3, 1, 2) / 255.0)
-        else:
-            return self.encoder(obs)
+    def get_states(self, x):
+        # x has shape (batch_size, seq_len, height, width, channels)
+        x = x.permute(0, 1, 4, 2, 3)
+        batch_size, seq_len = x.shape[0], x.shape[1]
+        x = x.contiguous().view(batch_size * seq_len, *x.shape[2:])  # Flatten sequence dimension
+        hidden = self.network(x / 255.0)  # Normalize pixel values
+        #hidden = self.input_proj(hidden)
+        hidden = hidden.view(batch_size, seq_len, -1)
+        output = self.mamba(hidden)
+        output = self.post_mamba(output)
+        return output
 
-    def get_value(self, seq_obs):
-        """
-        seq_obs: shape (B, seq_len, d_model), i.e. already embedded if you prefer
-        or shape (B, seq_len, *obs_shape) if you want to embed inside.
+    def get_value(self, x):
+        hidden = self.get_states(x)
+        last_hidden = hidden[:, -1, :]
+        return self.critic(last_hidden)
 
-        We'll assume we've already embedded to (B, seq_len, d_model) for simplicity.
-        -> Returns: (B,) for value.
-        """
-        # Mamba forward pass => (B, seq_len, d_model)
-        y = self.mamba(seq_obs)
-        # final token's hidden state
-        last_h = y[:, -1]               # (B, d_model)
-        last_h = self.post_mamba(last_h)
-        val = self.critic(last_h).squeeze(-1)
-        return val
-
-    def get_action_and_value(self, seq_obs, action=None):
-        """
-        seq_obs: shape (B, seq_len, d_model) or raw obs shape if you want to embed.
-        -> returns: (action, log_prob, entropy, value)
-        """
-        y = self.mamba(seq_obs)         # (B, seq_len, d_model)
-        last_h = y[:, -1]               # final step
-        last_h = self.post_mamba(last_h)
-
-        # Actor
-        dists = [Categorical(logits=branch(last_h)) for branch in self.actor_branches]
+    def get_action_and_value(self, x, action=None):
+        hidden = self.get_states(x)
+        last_hidden = hidden[:, -1, :]
+        logits = self.actor(last_hidden)
+        probs = Categorical(logits=logits)
         if action is None:
-            sample_actions = [dist.sample() for dist in dists]
-            action = torch.stack(sample_actions, dim=1)  # (B,#branches)
-
-        log_probs = torch.stack([dist.log_prob(action[:, i]) for i, dist in enumerate(dists)], dim=1)
-        entropies = torch.stack([dist.entropy() for dist in dists], dim=1).sum(dim=1)
-        val = self.critic(last_h).squeeze(-1)
-        return action, log_probs, entropies, val
+            action = probs.sample()
+        else:
+            action = action.view(-1)
+        logprob = probs.log_prob(action)
+        entropy = probs.entropy()
+        value = self.critic(last_hidden)
+        return action, logprob, entropy, value
 
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
+
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -223,7 +192,9 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % (
+            "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])
+        ),
     )
 
     # Seeding
@@ -234,15 +205,12 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # Env setup
+    # Environment setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    observation_space = envs.single_observation_space
-    action_space_shape = ((envs.single_action_space.n,) if isinstance(envs.single_action_space, gym.spaces.Discrete)
-                          else tuple(envs.single_action_space.nvec))
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
@@ -256,29 +224,32 @@ if __name__ == "__main__":
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
 
+    # Initialize observation buffers
+    sequence_length = args.seq_len
+    obs_shape = (sequence_length,) + envs.single_observation_space.shape
+    obs_buffers = [deque(maxlen=sequence_length) for _ in range(args.num_envs)]
+    obs_dim = envs.single_observation_space.shape  # (channels, height, width)
+
     # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + obs_shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-    env_buffers = [deque(maxlen=4) for _ in range(args.num_envs)]
-
     # Start the game
     global_step = 0
     start_time = time.time()
-    mamba_state = None
-    next_obs, _ = envs.reset(seed=[args.seed+i for i in range(args.num_envs)])
+    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
+    # Initialize buffers
     for i in range(args.num_envs):
-        emb = agent.encode_obs(obs[i].unsqueeze(0))  # shape (1,d_model)
-        for _ in range(args.seq_len):
-            env_buffers[i].append(emb)
+        for _ in range(sequence_length):
+            obs_buffers[i].append(next_obs[i].cpu().numpy())
 
     for update in range(1, num_updates + 1):
         # Annealing the learning rate
@@ -289,33 +260,35 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            obs[step] = next_obs
             dones[step] = next_done
 
-            seq_obs_list = []
+            # Update buffers
             for i in range(args.num_envs):
-                # stack the deque items => shape (seq_len,1,d_model)
-                frames = torch.cat(list(env_buffers[i]), dim=0)  # shape (seq_len, d_model)
-                seq_obs_list.append(frames.unsqueeze(0))        # => (1,seq_len,d_model)
-            seq_obs_batch = torch.cat(seq_obs_list, dim=0).to(device)
+                obs_buffers[i].append(next_obs[i].cpu().numpy())
+
+            # Prepare sequences
+            obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])
+            obs_sequences = torch.tensor(obs_sequences, dtype=torch.float32).to(device)
+            obs[step] = obs_sequences
 
             # Action logic
             with torch.no_grad():
-                action, logprob, entropy, value = agent.get_action_and_value(seq_obs_batch)               
-                values[step] = value.flatten()
+                action, logprob, _, value = agent.get_action_and_value(obs_sequences)
+                values[step] = value.view(-1)
             actions[step] = action
             logprobs[step] = logprob
 
             # Execute the game and log data
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
-            rewards[step] = torch.Tensor(reward).to(device).view(-1)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs = torch.Tensor(next_obs).to(device)
-            next_done = torch.Tensor(done, dtype=torch.float32).to(device)
+            next_done = torch.Tensor(done).to(device)
 
-            for i in range(args.num_envs):
-                emb = agent.encode_obs(next_obs[i].unsqueeze(0))  # shape (1, d_model)
-                env_buffers[i].append(emb)
+            # Reset buffers for environments that are done
+            for i, d in enumerate(done):
+                if d:
+                    obs_buffers[i] = deque([next_obs[i].cpu().numpy()] * sequence_length, maxlen=sequence_length)
 
             if 'final_info' in info:
                 final_info_array = np.array(info['final_info'])
@@ -329,15 +302,11 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_return", avg_return, global_step)
                 writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
-        seq_obs_list = []
-        for i in range(args.num_envs):
-            frames = torch.cat(list(env_buffers[i]), dim=0)  # (seq_len,d_model)
-            seq_obs_list.append(frames.unsqueeze(0))         # => (1,seq_len,d_model)
-        seq_obs_batch = torch.cat(seq_obs_list, dim=0).to(device)  # => (B,seq_len,d_model)
-
         # Bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(seq_obs_batch).reshape(1, -1)
+            obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])
+            obs_sequences = torch.tensor(obs_sequences, dtype=torch.float32).to(device)
+            next_value = agent.get_value(obs_sequences).view(1, -1)
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
@@ -363,16 +332,18 @@ if __name__ == "__main__":
                     returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
                 advantages = returns - values
 
-        # Flatten the batch
-        b_obs = obs.reshape(-1, *obs.shape[2:])
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        # Flatten the batch but keep the sequence dimension
+        b_obs = obs.transpose(1, 0)  # Shape: (num_envs, num_steps, seq_len, channels, height, width)
+        b_logprobs = logprobs.transpose(1, 0)
+        b_actions = actions.transpose(1, 0)
+        b_advantages = advantages.transpose(1, 0)
+        b_returns = returns.transpose(1, 0)
+        b_values = values.transpose(1, 0)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        assert args.num_envs % args.num_minibatches == 0
+        envsperbatch = args.num_envs // args.num_minibatches
+        envinds = np.arange(args.num_envs)
         clipfracs = []
 
         # Initialize accumulators for metrics
@@ -386,19 +357,32 @@ if __name__ == "__main__":
         grad_norm_list = []
 
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(envinds)
+            for start in range(0, args.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                # Get sequences for the minibatch environments
+                mb_obs = b_obs[mbenvinds]
+                mb_actions = b_actions[mbenvinds]
+                mb_logprobs = b_logprobs[mbenvinds]
+                mb_advantages = b_advantages[mbenvinds]
+                mb_returns = b_returns[mbenvinds]
+                mb_values = b_values[mbenvinds]
 
-                mb_obs = b_obs[mb_inds]
-                mb_actions = b_actions[mb_inds]
-                mb_logprobs = b_logprobs[mb_inds]
-                mb_advantages = b_advantages[mb_inds]
-                mb_returns = b_returns[mb_inds]
-                mb_values = b_values[mb_inds]
+                # Flatten batch and steps
+                mb_obs = mb_obs.reshape(-1, sequence_length, *obs_dim)
+                mb_actions = mb_actions.reshape(-1)
+                mb_logprobs = mb_logprobs.reshape(-1)
+                mb_advantages = mb_advantages.reshape(-1)
+                mb_returns = mb_returns.reshape(-1)
+                mb_values = mb_values.reshape(-1)
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions)
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions.long())
+                newlogprob = newlogprob.view(-1)
+                entropy = entropy.view(-1)
+                newvalue = newvalue.view(-1)
+
+                # Compute ratios
                 logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
@@ -417,22 +401,22 @@ if __name__ == "__main__":
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
-                newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_loss_unclipped = (newvalue - mb_returns) ** 2
+                    v_clipped = mb_values + torch.clamp(
+                        newvalue - mb_values,
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -452,7 +436,7 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-        
+
         # Compute means
         avg_total_loss = np.mean(total_loss_list)
         avg_pg_loss = np.mean(pg_loss_list)
@@ -489,6 +473,6 @@ if __name__ == "__main__":
         video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
         for video_file in video_files:
             wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
-
-    writer.close()
+    
     envs.close()
+    writer.close()
