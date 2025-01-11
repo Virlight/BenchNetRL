@@ -54,10 +54,12 @@ def draw(data_dict, smooth_window=5, title="", xlabel="Training Steps", ylabel="
     plt.figure(figsize=(10, 6))
     plt.xlabel(xlabel, fontsize=14)
     plt.ylabel(ylabel, fontsize=14)
+    print(data_dict.keys())
 
     for i, (label, episode_rewards) in enumerate(data_dict.items()):
-        timestep = np.array(episode_rewards)[1][:, 0]
-        reward = np.array(episode_rewards)[:2, :, 1]
+        print(label, episode_rewards)
+        timestep = np.array(episode_rewards)[0][:, 0]
+        reward = np.array(episode_rewards)[0][:, 1]
         mean_reward, std_reward = np.mean(reward, axis=0), np.std(reward, axis=0, ddof=1)
         mean_reward = smoothen(mean_reward, smooth_window)
         std_reward = smoothen(std_reward, smooth_window)
@@ -71,7 +73,7 @@ def draw(data_dict, smooth_window=5, title="", xlabel="Training Steps", ylabel="
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, format='pdf')
+        plt.savefig(save_path, format='png')
     plt.show()
 
 
