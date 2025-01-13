@@ -198,6 +198,9 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
+    if args.cuda and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available on this system.")
+
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # Environment setup
@@ -284,17 +287,17 @@ if __name__ == "__main__":
                 if d:
                     obs_buffers[i] = deque([next_obs[i].cpu().numpy()] * sequence_length, maxlen=sequence_length)
 
-            if 'final_info' in info:
-                final_info_array = np.array(info['final_info'])
-                valid_indices = np.where(final_info_array != None)[0]
-                valid_final_infos = final_info_array[valid_indices]
-                episodic_returns = np.array([entry['episode']['r'] for entry in valid_final_infos if 'episode' in entry])
-                episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
-                avg_return = float(f'{np.round(np.mean(episodic_returns), 2):.2f}')
-                avg_length = float(f'{np.round(np.mean(episodic_lengths), 2):.2f}')
-                print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
-                writer.add_scalar("charts/episodic_return", avg_return, global_step)
-                writer.add_scalar("charts/episodic_length", avg_length, global_step)
+            final_info = info.get('final_info')
+            if final_info is not None and len(final_info) > 0:
+                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
+                if valid_entries:
+                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
+                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
+                    avg_return = float(f'{np.mean(episodic_returns):.3f}')
+                    avg_length = float(f'{np.mean(episodic_lengths):.3f}')
+                    print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                    writer.add_scalar("charts/episodic_return", avg_return, global_step)
+                    writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
         # Bootstrap value if not done
         with torch.no_grad():

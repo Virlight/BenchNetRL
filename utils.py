@@ -35,37 +35,54 @@ def smoothen(data, window_size):
 
 
 def draw(data_dict, smooth_window=5, title="", xlabel="Training Steps", ylabel="Average Reward", save_path=None, colors=None):
-    """
-    Draws a visualization for RL training data.
-    
-    Args:
-        data_dict (dict): Dictionary where keys are labels and values are lists of episode rewards.
-        smooth_window (int): Window size for smoothing.
-        title (str): Title of the plot.
-        xlabel (str): Label for the X-axis.
-        ylabel (str): Label for the Y-axis.
-        save_path (str): File path to save the plot. If None, the plot will not be saved.
-        colors (list): List of colors for the plots.
-    """
     if colors is None:
-        colors = ['orange', 'hotpink', 'dodgerblue', 'mediumpurple', 'c', 'cadetblue', 
-                  'steelblue', 'mediumslateblue', 'mediumturquoise']
+        colors = ['orange', 'hotpink', 'dodgerblue', 'mediumpurple', 'c', 
+                  'cadetblue', 'steelblue', 'mediumslateblue', 'mediumturquoise']
 
     plt.figure(figsize=(10, 6))
     plt.xlabel(xlabel, fontsize=14)
     plt.ylabel(ylabel, fontsize=14)
-    print(data_dict.keys())
+    print("Labels:", data_dict.keys())
 
-    for i, (label, episode_rewards) in enumerate(data_dict.items()):
-        print(label, episode_rewards)
-        timestep = np.array(episode_rewards)[0][:, 0]
-        reward = np.array(episode_rewards)[0][:, 1]
-        mean_reward, std_reward = np.mean(reward, axis=0), np.std(reward, axis=0, ddof=1)
+    for i, (label, runs_data) in enumerate(data_dict.items()):
+        if not runs_data:
+            print(f"No data available for label {label}; skipping.")
+            continue
+
+        # Convert each run's data to a NumPy array if not empty
+        arrays = [np.array(run) for run in runs_data if run and len(run) > 0]
+        if not arrays:
+            print(f"No valid arrays for label {label}; skipping.")
+            continue
+
+        # Collect all unique time steps across all runs
+        all_steps = sorted(set().union(*(arr[:, 0] for arr in arrays)))
+
+        # Create a list of pandas Series for each run, indexed by time steps
+        run_series = []
+        for arr in arrays:
+            s = pd.Series(data=arr[:, 1], index=arr[:, 0])
+            # Remove duplicate indices by keeping the last occurrence
+            s = s[~s.index.duplicated(keep='last')]
+            # Reindex to include all_steps, forward-fill missing values
+            s = s.reindex(all_steps, method='ffill')
+            run_series.append(s)
+
+        # Concatenate all series into a DataFrame, aligning on the index (time steps)
+        df = pd.concat(run_series, axis=1)
+
+        # Compute mean and standard deviation across runs for each time step
+        mean_reward = df.mean(axis=1).values
+        std_reward = df.std(axis=1, ddof=1).values
+        timestep = np.array(all_steps)
+
+        # Smooth the mean and std rewards if a smoothing window is specified
         mean_reward = smoothen(mean_reward, smooth_window)
         std_reward = smoothen(std_reward, smooth_window)
-        
+
         plt.plot(timestep, mean_reward, color=colors[i % len(colors)], label=label, linewidth=1.5)
-        plt.fill_between(timestep, mean_reward - std_reward, mean_reward + std_reward, alpha=0.2, color=colors[i % len(colors)])
+        plt.fill_between(timestep, mean_reward - std_reward, mean_reward + std_reward, 
+                         alpha=0.2, color=colors[i % len(colors)])
 
     plt.title(title, fontsize=16, pad=12)
     plt.legend(loc="best", fontsize=12)

@@ -366,6 +366,9 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
+    if args.cuda and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available on this system.")
+
     # Determine the device to be used for training and set the default tensor type
     if args.cuda:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

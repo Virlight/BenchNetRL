@@ -1,19 +1,18 @@
 import tensorflow as tf
 import os
+import glob
 import utils  # Your utils.py functions
+
+def find_event_file_in_folder(folder_path):
+    """Finds the (assumed single) TensorBoard event file in a given folder."""
+    pattern = os.path.join(folder_path, "events.out.tfevents.*")
+    files = glob.glob(pattern)
+    return files[0] if files else None
 
 def read_tfevents(file_path, tag_name="reward", step=4):
     """
-    Reads TensorBoard event file and extracts scalars for a specific tag,
+    Reads a TensorBoard event file and extracts scalars for a specific tag,
     taking every `step` points.
-    
-    Args:
-        file_path (str): Path to the .tfevents file.
-        tag_name (str): Tag of the scalar to extract.
-        step (int): Interval for downsampling points.
-    
-    Returns:
-        list of [step, value] pairs.
     """
     scalar_data = []
     for i, event in enumerate(tf.compat.v1.train.summary_iterator(file_path)):
@@ -22,47 +21,41 @@ def read_tfevents(file_path, tag_name="reward", step=4):
                 scalar_data.append([event.step, value.simple_value])
     return scalar_data
 
-def convert_tfevents_to_dict(event_paths, tag_name="reward", step=4):
+def aggregate_data_from_folders(folders, tag_name, step):
     """
-    Converts a list of TensorBoard .tfevents paths into a dictionary for visualization.
+    For a list of folders, finds the event file in each folder, reads, and collects their data.
+    Returns a list of arrays, each corresponding to one run's data.
+    """
+    all_runs_data = []
+    for folder in folders:
+        event_file = find_event_file_in_folder(folder)
+        if event_file:
+            data = read_tfevents(event_file, tag_name, step)
+            if data:
+                all_runs_data.append(data)
+    return all_runs_data
 
-    Args:
-        event_paths (list): List of .tfevents file paths.
-        tag_name (str): The scalar tag to extract (e.g., 'reward').
-        step (int): Interval for downsampling points.
+def visualize_from_tfevents(folder_groups, labels, tag_name="reward", smooth_window=5, 
+                           title="RL Training Visualization", save_path=None, step=4):
+    """
+    Visualizes RL training performance using TensorBoard event files from folders.
     
-    Returns:
-        dict: Dictionary where keys are filenames, and values are episode rewards.
-    """
-    data_dict = {}
-    for path in event_paths:
-        label = os.path.basename(path).split('.')[0]  # Label based on file name
-        data = read_tfevents(path, tag_name, step)
-        data_dict[label] = [data]
-    return data_dict
-
-def visualize_from_tfevents(event_paths, labels, tag_name="reward", smooth_window=5, title="RL Training Visualization", save_path=None, step=4):
-    """
-    Visualizes RL training performance using TensorBoard event files, taking every `step` points.
-
     Args:
-        event_paths (list): List of lists of .tfevents file paths.
-        labels (list): List of labels corresponding to each group of paths.
+        folder_groups (list): List of lists, each containing folder paths (runs) for a label.
+        labels (list): List of labels corresponding to each group of folders.
         tag_name (str): Scalar tag to extract and visualize.
         smooth_window (int): Window size for smoothing.
         title (str): Title of the plot.
         save_path (str): Path to save the plot.
         step (int): Interval for downsampling points.
     """
-    assert len(event_paths) == len(labels), "Each label must correspond to a set of event paths."
+    assert len(folder_groups) == len(labels), "Each label must correspond to a set of folders."
 
     data_dict = {}
-    for label, paths in zip(labels, event_paths):
-        episode_rewards = []
-        for path in paths:
-            list_data = read_tfevents(path, tag_name=tag_name, step=step)
-            episode_rewards.append(list_data)
-        data_dict[label] = episode_rewards
+    for label, folders in zip(labels, folder_groups):
+        # Aggregate data from all event files in the given folders
+        runs_data = aggregate_data_from_folders(folders, tag_name, step)
+        data_dict[label] = runs_data
 
     utils.draw(data_dict, smooth_window, title, "Training Steps", "Average Reward", save_path)
 
@@ -79,23 +72,42 @@ def print_tfevents(file_path):
             print(f"Step: {event.step}, Tag: {value.tag}, Value: {value.simple_value}")
 
 if __name__ == "__main__":
-    event_paths = [
+    folder_groups = [
+        # [
+        #     "runs\CartPole-v1__ppo__1__1736687598"
+        # ],
+        # [
+        #     "runs\CartPole-v1__ppo__1__1736687709"
+        # ],
+        # [
+        #     "runs\CartPole-v1__ppo__2__1736687660"
+        # ],
         [
-            "events.out.tfevents1.0"
+            "runs\CartPole-v1__ppo__1__1736687709",
+            "runs\CartPole-v1__ppo__2__1736687660"
         ],
         [
-            "runs\CartPole-v1__ppo__1__1728577357\events.out.tfevents.1728577357.Tornadosky.22916.0"
+            "runs\CartPole-v1__ppo__1__1736687709",
+            "runs\CartPole-v1__ppo__2__1736687660",
+            "runs\CartPole-v1__ppo__3__1736688619",
+            "runs\CartPole-v1__ppo__4__1736688670",
+            "runs\CartPole-v1__ppo__5__1736688719",
+            "runs\CartPole-v1__ppo__6__1736688815",
+            "runs\CartPole-v1__ppo__7__1736688906",
+            "runs\CartPole-v1__ppo__8__1736688952",
+            "runs\CartPole-v1__ppo__9__1736688997",
+            "runs\CartPole-v1__ppo__10__1736689043"
         ]
     ]
-    labels = ["PPO-Mamba", "PPO-LSTM"]
+    labels = ["PPO-Combined2", "PPO-Combined10"]
     #print_tfevents("runs\CartPole-v1__ppo__1__1728577357\events.out.tfevents.1728577357.Tornadosky.22916.0")
 
     visualize_from_tfevents(
-        event_paths=event_paths,
+        folder_groups=folder_groups,
         labels=labels,
         tag_name="charts/episodic_return",
-        smooth_window=100,
+        smooth_window=200,
         title="RL Training Visualization from TensorBoard",
         save_path="rl_training_plot_tensorboard.png",
-        step=50000
+        step=1
     )

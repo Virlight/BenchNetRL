@@ -5,6 +5,10 @@ wandb/
 videos/
 charts_episodic_return/
 
+# assets
+*.png
+*.pdf
+
 #official python gitignore
 # Byte-compiled / optimized / DLL files
 .vscode/

@@ -144,6 +144,9 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
+    if args.cuda and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available on this system.")
+
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # Env setup
@@ -211,8 +214,8 @@ if __name__ == "__main__":
                 valid_final_infos = final_info_array[valid_indices]
                 episodic_returns = np.array([entry['episode']['r'] for entry in valid_final_infos if 'episode' in entry])
                 episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
-                avg_return = np.round(np.mean(episodic_returns), 2)
-                avg_length = np.round(np.mean(episodic_lengths), 2)
+                avg_return = float(f'{np.round(np.mean(episodic_returns), 3):.3f}')
+                avg_length = float(f'{np.round(np.mean(episodic_lengths), 3):.3f}')
                 print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
                 writer.add_scalar("charts/episodic_return", avg_return, global_step)
                 writer.add_scalar("charts/episodic_length", avg_length, global_step)
