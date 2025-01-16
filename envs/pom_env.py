@@ -28,7 +28,7 @@ class PoMEnv(gym.Env):
 
     def __init__(self, render_mode="human"):
         self._freeze = True
-        self._step_size = 0.2
+        self._step_size = 0.1
         self._min_steps = int(1.0 / self._step_size) + 1
         self._time_penalty = 0.1
         self._num_show_steps = 2

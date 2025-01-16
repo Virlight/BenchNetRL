@@ -13,7 +13,7 @@ import torch.optim as optim
 import tyro
 from einops import rearrange
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
-from pom_env import PoMEnv  # noqa
+from envs.pom_env import PoMEnv  # noqa
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
