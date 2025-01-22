@@ -5,8 +5,9 @@ import time
 from collections import deque
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
 import numpy as np
+import wandb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -29,7 +30,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
-    parser.add_argument("--gym-id", type=str, default="BreakoutNoFrameskip-v4",
+    parser.add_argument("--gym-id", type=str, default="ALE/Breakout-v5",
         help="the id of the gym environment")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,
         help="the learning rate of the optimizer")
@@ -83,6 +84,10 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--seq-len", type=int, default=4,
         help="sequence length for Mamba model")
+    parser.add_argument("--hidden-dim", type=int, default=128,
+        help="Size of the hidden dimension for the Mamba model")
+    parser.add_argument("--reconstruction-coef", type=float, default=0.0,
+        help="Coefficient for optional observation reconstruction loss (0 disables it)")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -100,7 +105,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         env = ClipRewardEnv(env)
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
+        env = gym.wrappers.FrameStack(env, 1)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env.reset(seed=seed)
@@ -117,10 +122,11 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, args):
         super(Agent, self).__init__()
+
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
             nn.ReLU(),
             layer_init(nn.Conv2d(32, 64, 4, stride=2)),
             nn.ReLU(),
@@ -130,15 +136,29 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
-        self.input_proj = layer_init(nn.Linear(512, 128))
+
+        if args.reconstruction_coef > 0:
+            self.transposed_cnn = nn.Sequential(
+                layer_init(nn.Linear(args.hidden_dim, 64 * 7 * 7)),
+                nn.ReLU(),
+                nn.Unflatten(1, (64, 7, 7)),
+                layer_init(nn.ConvTranspose2d(64, 64, 3, stride=1)),
+                nn.ReLU(),
+                layer_init(nn.ConvTranspose2d(64, 32, 4, stride=2)),
+                nn.ReLU(),
+                layer_init(nn.ConvTranspose2d(32, 1, 8, stride=4)),
+                nn.Sigmoid(),
+            )
+        
+        self.input_proj = layer_init(nn.Linear(512, args.hidden_dim))
         self.mamba = Mamba(
-            d_model=128,
+            d_model=args.hidden_dim,
             d_state=16,
             d_conv=4,
             expand=2,
         )
-        self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(128, 1), std=1)
+        self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1)
 
     def get_states(self, x):
         # x has shape (batch_size, seq_len, channels, height, width)
@@ -158,23 +178,23 @@ class Agent(nn.Module):
     def get_action_and_value(self, x, action=None):
         hidden = self.get_states(x)
         last_hidden = hidden[:, -1, :]
+        self.x = last_hidden
         logits = self.actor(last_hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
         else:
             action = action.view(-1)
-        logprob = probs.log_prob(action)
-        entropy = probs.entropy()
-        value = self.critic(last_hidden)
-        return action, logprob, entropy, value
+        return action, probs.log_prob(action), probs.entropy(), self.critic(last_hidden)
+    def reconstruct_observation(self):
+        x = self.transposed_cnn(self.x)
+        return x
+
 
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
-        import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -202,6 +222,7 @@ if __name__ == "__main__":
         raise RuntimeError("CUDA requested but not available on this system.")
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    torch.set_default_device(device)
 
     # Environment setup
     envs = gym.vector.SyncVectorEnv(
@@ -209,14 +230,15 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
 
     # Count and log parameters after agent initialization
     if args.track:
         total_params = sum(p.numel() for p in agent.parameters())
         trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-        import wandb
+
         wandb.config.update({
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
@@ -239,7 +261,8 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset(seed=[args.seed + i for i in range(args.num_envs)])[0]).to(device)
+    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
+    next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
@@ -299,7 +322,7 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episodic_return", avg_return, global_step)
                     writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
-        # Bootstrap value if not done
+        # bootstrap value if not done
         with torch.no_grad():
             obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])
             obs_sequences = torch.tensor(obs_sequences, dtype=torch.float32).to(device)
@@ -377,14 +400,12 @@ if __name__ == "__main__":
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions.long())
                 newlogprob = newlogprob.view(-1)
                 entropy = entropy.view(-1)
-                newvalue = newvalue.view(-1)
 
-                # Compute ratios
                 logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # Calculate approx_kl
+                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -398,6 +419,7 @@ if __name__ == "__main__":
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
+                newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - mb_returns) ** 2
                     v_clipped = mb_values + torch.clamp(
@@ -413,6 +435,16 @@ if __name__ == "__main__":
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                reconstruction_loss = torch.tensor(0.0, device=device)
+                if args.reconstruction_coef > 0.0:
+                    predicted_obs = agent.reconstruct_observation()
+                    target_obs = mb_obs.float() / 255.0
+                    assert predicted_obs.shape == target_obs.shape, (
+                        f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
+                    )
+                    reconstruction_loss = bce_loss(predicted_obs, target_obs)
+                    loss += args.reconstruction_coef * reconstruction_loss
                 writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
@@ -463,7 +495,6 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", sps, global_step)
 
     if args.track and args.capture_video:
-        import wandb
         wandb.save(f"videos/{run_name}/*.mp4")
         wandb.save(f"videos/{run_name}/*.json")
         video_path = f"videos/{run_name}"

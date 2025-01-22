@@ -4,8 +4,9 @@ import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
 import numpy as np
+import wandb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
-    parser.add_argument("--gym-id", type=str, default="BreakoutNoFrameskip-v4",
+    parser.add_argument("--gym-id", type=str, default="ALE/Breakout-v5",
         help="the id of the gym environment")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,
         help="the learning rate of the optimizer")
@@ -77,6 +78,12 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--rnn-type", type=str, default="lstm", choices=["lstm", "gru"],
+        help="Type of recurrent cell to use: 'lstm' or 'gru'")
+    parser.add_argument("--rnn-hidden-dim", type=int, default=128,
+        help="Size of the hidden dimension for the LSTM or GRU")
+    parser.add_argument("--reconstruction-coef", type=float, default=0.0,
+        help="Coefficient for optional observation reconstruction loss (0 disables it)")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -94,7 +101,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         env = ClipRewardEnv(env)
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
+        env = gym.wrappers.FrameStack(env, 1)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env.reset(seed=seed)
@@ -111,10 +118,12 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, args):
         super(Agent, self).__init__()
+        self.rnn_hidden_dim = args.rnn_hidden_dim
+
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
             nn.ReLU(),
             layer_init(nn.Conv2d(32, 64, 4, stride=2)),
             nn.ReLU(),
@@ -124,54 +133,80 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
+
+        if args.reconstruction_coef > 0:
+            self.transposed_cnn = nn.Sequential(
+                layer_init(nn.Linear(self.rnn_hidden_dim, 64 * 7 * 7)),
+                nn.ReLU(),
+                nn.Unflatten(1, (64, 7, 7)),
+                layer_init(nn.ConvTranspose2d(64, 64, 3, stride=1)),
+                nn.ReLU(),
+                layer_init(nn.ConvTranspose2d(64, 32, 4, stride=2)),
+                nn.ReLU(),
+                layer_init(nn.ConvTranspose2d(32, 1, 8, stride=4)),
+                nn.Sigmoid(),
+            )
         
-        self.lstm = nn.LSTM(512, 128)
-        for name, param in self.lstm.named_parameters():
+        if args.rnn_type == "lstm":
+            self.rnn = nn.LSTM(512, self.rnn_hidden_dim)
+        else:
+            self.rnn = nn.GRU(512, self.rnn_hidden_dim)
+        for name, param in self.rnn.named_parameters():
             if "bias" in name:
                 nn.init.constant_(param, 0)
             elif "weight" in name:
                 nn.init.orthogonal_(param, 1.0)
-        self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(128, 1), std=1.0)
+        self.actor = layer_init(nn.Linear(self.rnn_hidden_dim, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(self.rnn_hidden_dim, 1), std=1.0)
 
-    def get_states(self, x, lstm_state, done):
+    def get_states(self, x, rnn_state, done):
         hidden = self.network(x / 255.0)
 
-        # LSTM logic
-        batch_size = lstm_state[0].shape[1]
-        hidden = hidden.reshape((-1, batch_size, self.lstm.input_size))
+        batch_size = rnn_state[0].shape[1] if args.rnn_type == "lstm" else rnn_state.shape[1]
+        hidden = hidden.reshape((-1, batch_size, self.rnn.input_size))
+
         done = done.reshape((-1, batch_size))
         new_hidden = []
-        for h, d in zip(hidden, done):
-            h, lstm_state = self.lstm(
-                h.unsqueeze(0),
-                (
-                    (1.0 - d).view(1, -1, 1) * lstm_state[0],
-                    (1.0 - d).view(1, -1, 1) * lstm_state[1],
-                ),
-            )
-            new_hidden += [h]
-        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
-        return new_hidden, lstm_state
+        for h_in, d in zip(hidden, done):
+            if args.rnn_type == "lstm":
+                h, c = rnn_state
+                h = (1.0 - d).view(1, -1, 1) * h
+                c = (1.0 - d).view(1, -1, 1) * c
+                out, (h, c) = self.rnn(h_in.unsqueeze(0), (h, c))
+                rnn_state = (h, c)
+            else:
+                # GRU
+                h = rnn_state
+                h = (1.0 - d).view(1, -1, 1) * h
+                out, h = self.rnn(h_in.unsqueeze(0), h)
+                rnn_state = h
+            new_hidden.append(out)
 
-    def get_value(self, x, lstm_state, done):
-        hidden, _ = self.get_states(x, lstm_state, done)
+        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+        return new_hidden, rnn_state
+
+    def get_value(self, x, rnn_state, done):
+        hidden, _ = self.get_states(x, rnn_state, done)
         return self.critic(hidden)
 
-    def get_action_and_value(self, x, lstm_state, done, action=None):
-        hidden, lstm_state = self.get_states(x, lstm_state, done)
+    def get_action_and_value(self, x, rnn_state, done, action=None):
+        hidden, rnn_state = self.get_states(x, rnn_state, done)
+        self.x = hidden
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), lstm_state
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), rnn_state
+    
+    def reconstruct_observation(self):
+        x = self.transposed_cnn(self.x)
+        return x
 
 
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
-        import wandb
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -199,6 +234,7 @@ if __name__ == "__main__":
         raise RuntimeError("CUDA requested but not available on this system.")
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    torch.set_default_device(device)
 
     # Environment setup
     envs = gym.vector.SyncVectorEnv(
@@ -206,8 +242,9 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
 
     # Count and log parameters after agent initialization
     if args.track:
@@ -233,14 +270,19 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-    next_lstm_state = (
-        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
-        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
-    )
+
+    if args.rnn_type == "lstm":
+        next_rnn_state = (
+            torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn_hidden_dim).to(device),
+            torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn_hidden_dim).to(device),
+        )
+    else:
+        next_rnn_state = torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn_hidden_dim).to(device)
+    
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(1, num_updates + 1):
-        initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
+        initial_rnn_state = (next_rnn_state[0].clone(), next_rnn_state[1].clone()) if args.rnn_type == "lstm" else next_rnn_state.clone()
         # Annealing the learning rate
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -254,7 +296,7 @@ if __name__ == "__main__":
 
             # Action logic
             with torch.no_grad():
-                action, logprob, _, value, next_lstm_state = agent.get_action_and_value(next_obs, next_lstm_state, next_done)
+                action, logprob, _, value, next_rnn_state = agent.get_action_and_value(next_obs, next_rnn_state, next_done)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -282,7 +324,7 @@ if __name__ == "__main__":
         with torch.no_grad():
             next_value = agent.get_value(
                 next_obs,
-                next_lstm_state,
+                next_rnn_state,
                 next_done,
             ).reshape(1, -1)
             if args.gae:
@@ -343,9 +385,18 @@ if __name__ == "__main__":
                 mbenvinds = envinds[start:end]
                 mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
 
+                if args.rnn_type == "lstm":
+                    rnn_slice = (
+                        initial_rnn_state[0][:, mbenvinds],
+                        initial_rnn_state[1][:, mbenvinds],
+                    )
+                else:
+                    # GRU => single hidden state
+                    rnn_slice = initial_rnn_state[:, mbenvinds]
+
                 _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
                     b_obs[mb_inds],
-                    (initial_lstm_state[0][:, mbenvinds], initial_lstm_state[1][:, mbenvinds]),
+                    rnn_slice,
                     b_dones[mb_inds],
                     b_actions.long()[mb_inds],
                 )
@@ -384,6 +435,16 @@ if __name__ == "__main__":
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                reconstruction_loss = torch.tensor(0.0, device=device)
+                if args.reconstruction_coef > 0.0:
+                    predicted_obs = agent.reconstruct_observation()
+                    target_obs = b_obs[mb_inds].float() / 255.0
+                    assert predicted_obs.shape == target_obs.shape, (
+                        f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
+                    )
+                    reconstruction_loss = bce_loss(predicted_obs, target_obs)
+                    loss += args.reconstruction_coef * reconstruction_loss
                 writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
@@ -429,8 +490,9 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        sps = int(global_step / (time.time() - start_time))
+        print("SPS:", sps)
+        writer.add_scalar("charts/SPS", sps, global_step)
 
     if args.track and args.capture_video:
         wandb.save(f"videos/{run_name}/*.mp4")
@@ -439,6 +501,6 @@ if __name__ == "__main__":
         video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
         for video_file in video_files:
             wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
-    
+
     envs.close()
     writer.close()

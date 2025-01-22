@@ -2,32 +2,41 @@ import argparse
 import os
 import random
 import time
-from collections import deque
 from distutils.util import strtobool
 
 import gymnasium as gym
 import numpy as np
+import wandb
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Categorical
+from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 from layers import Transformer
+
+# Import Atari wrappers
+from stable_baselines3.common.atari_wrappers import (
+    ClipRewardEnv,
+    EpisodicLifeEnv,
+    FireResetEnv,
+    MaxAndSkipEnv,
+    NoopResetEnv,
+)
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
-    parser.add_argument("--gym-id", type=str, default="MortarMayhem-v0",
+    parser.add_argument("--gym-id", type=str, default="ALE/Breakout-v5",
         help="the id of the gym environment")
     parser.add_argument("--learning-rate", type=float, default=2.75e-4,
-        help="the initial learning rate of the optimizer")
+        help="the learning rate of the optimizer")
     parser.add_argument("--final-lr", type=float, default=1.0e-5,
         help="the final learning rate after annealing")
     parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
-    parser.add_argument("--total-timesteps", type=int, default=100000000,
+    parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
     parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
@@ -35,7 +44,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="ppo-minigrid",
+    parser.add_argument("--wandb-project-name", type=str, default="ppo-mamba",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -64,7 +73,7 @@ def parse_args():
     parser.add_argument("--clip-coef", type=float, default=0.1,
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="use a clipped loss for the value function")
+        help="Toggle whether or not to use a clipped loss for the value function")
     parser.add_argument("--init-ent-coef", type=float, default=0.0001,
         help="initial entropy coefficient")
     parser.add_argument("--final-ent-coef", type=float, default=0.000001,
@@ -88,8 +97,7 @@ def parse_args():
     parser.add_argument("--trxl-positional-encoding", type=str, default="absolute",
         help='the positional encoding type: "", "absolute", "learned"')
     parser.add_argument("--reconstruction-coef", type=float, default=0.0,
-        help="the coefficient of the observation reconstruction loss")
-
+        help="Coefficient for optional observation reconstruction loss (0 disables it)")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -98,23 +106,23 @@ def parse_args():
 
 def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
-        import memory_gym
-        # Example reset parameters for Mortar Mayhem:
-        # See https://github.com/MarcoMeter/drl-memory-gym
-        env = gym.make(
-            gym_id,
-            render_mode="rgb_array" if capture_video else None,
-        )
-
+        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = NoopResetEnv(env, noop_max=30)
+        env = MaxAndSkipEnv(env, skip=4)
+        env = EpisodicLifeEnv(env)
+        if "FIRE" in env.unwrapped.get_action_meanings():
+            env = FireResetEnv(env)
+        env = ClipRewardEnv(env)
+        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        env = gym.wrappers.GrayScaleObservation(env)
+        env = gym.wrappers.FrameStack(env, 1)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-
         env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
-
     return thunk
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -170,8 +178,7 @@ class Agent(nn.Module):
         )
         self.critic = layer_init(nn.Linear(args.trxl_dim, 1), 1)
 
-        self.reconstruction_coef = args.reconstruction_coef
-        if self.reconstruction_coef > 0.0:
+        if args.reconstruction_coef > 0:
             self.transposed_cnn = nn.Sequential(
                 layer_init(nn.Linear(args.trxl_dim, 64 * 7 * 7)),
                 nn.ReLU(),
@@ -216,7 +223,6 @@ if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
-        import wandb
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -229,7 +235,9 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % (
+            "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])
+        ),
     )
 
     # Seeding
@@ -244,11 +252,11 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     torch.set_default_device(device)
 
-    # Env setup
+    # Environment setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
-    #assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     observation_space = envs.single_observation_space
     action_space_shape = ((envs.single_action_space.n,) if isinstance(envs.single_action_space, gym.spaces.Discrete)
@@ -265,36 +273,36 @@ if __name__ == "__main__":
 
     agent = Agent(args, observation_space, action_space_shape, max_episode_steps).to(device)
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate)
-    bce_loss = nn.BCELoss()
+    bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
 
     # Count and log parameters after agent initialization
     if args.track:
         total_params = sum(p.numel() for p in agent.parameters())
         trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-        import wandb
+        
         wandb.config.update({
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
 
     # Storage setup
-    rewards = torch.zeros((args.num_steps, args.num_envs))
-    actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long)
-    dones = torch.zeros((args.num_steps, args.num_envs))
-    obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape)
-    log_probs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)))
-    values = torch.zeros((args.num_steps, args.num_envs))
+    obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long).to(device)
+    logprobs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape))).to(device)
+    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     stored_memories = []
     stored_memory_masks = torch.zeros((args.num_steps, args.num_envs, args.trxl_memory_length), dtype=torch.bool)
     stored_memory_index = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long)
     stored_memory_indices = torch.zeros((args.num_steps, args.num_envs, args.trxl_memory_length), dtype=torch.long)
 
+    # Start the game
     global_step = 0
     start_time = time.time()
-    episode_infos = deque(maxlen=100)
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs)
+    next_done = torch.zeros(args.num_envs).to(device)
     next_memory = torch.zeros((args.num_envs, max_episode_steps, args.trxl_num_layers, args.trxl_dim), dtype=torch.float32)
     memory_mask = torch.tril(torch.ones((args.trxl_memory_length, args.trxl_memory_length)), diagonal=-1)
 
@@ -324,27 +332,28 @@ if __name__ == "__main__":
         for e in range(args.num_envs):
             stored_memory_index[:, e] = e
 
-        for step in range(args.num_steps):
+        for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
             stored_memory_masks[step] = memory_mask[torch.clip(env_current_episode_step, 0, args.trxl_memory_length - 1)]
             stored_memory_indices[step] = memory_indices[env_current_episode_step]
 
+            # Action logic
             with torch.no_grad():
                 memory_window = batched_index_select(next_memory, 1, stored_memory_indices[step])
                 action, logprob, _, value, new_memory = agent.get_action_and_value(
                     next_obs, memory_window, stored_memory_masks[step], stored_memory_indices[step]
                 )
                 next_memory[torch.arange(args.num_envs), env_current_episode_step] = new_memory
-                actions[step], log_probs[step], values[step] = action, logprob, value
+                actions[step], logprobs[step], values[step] = action, logprob, value
 
-            # Step environment
-            next_obs_, reward, terminations, truncations, info = envs.step(action.cpu().numpy())
-            next_done = np.logical_or(terminations, truncations)
+            # Execute the game and log data
+            next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+            done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs = torch.Tensor(next_obs_).to(device)
-            next_done = torch.Tensor(next_done).to(device)
+            next_obs = torch.Tensor(next_obs).to(device)
+            next_done = torch.Tensor(done).to(device)
 
             # If done, reset environment memory
             for idx, d in enumerate(next_done):
@@ -361,19 +370,19 @@ if __name__ == "__main__":
                 else:
                     env_current_episode_step[idx] += 1
 
-            if 'final_info' in info:
-                final_info_array = np.array(info['final_info'])
-                valid_indices = np.where(final_info_array != None)[0]
-                valid_final_infos = final_info_array[valid_indices]
-                episodic_returns = np.array([entry['episode']['r'] for entry in valid_final_infos if 'episode' in entry])
-                episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
-                avg_return = float(f'{np.round(np.mean(episodic_returns), 3):.3f}')
-                avg_length = float(f'{np.round(np.mean(episodic_lengths), 3):.3f}')
-                print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
-                writer.add_scalar("charts/episodic_return", avg_return, global_step)
-                writer.add_scalar("charts/episodic_length", avg_length, global_step)
+            final_info = info.get('final_info')
+            if final_info is not None and len(final_info) > 0:
+                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
+                if valid_entries:
+                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
+                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
+                    avg_return = float(f'{np.mean(episodic_returns):.3f}')
+                    avg_length = float(f'{np.mean(episodic_lengths):.3f}')
+                    print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                    writer.add_scalar("charts/episodic_return", avg_return, global_step)
+                    writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
-        # Bootstrap value if not done
+        # bootstrap value if not done
         with torch.no_grad():
             start_idx = torch.clip(env_current_episode_step - args.trxl_memory_length, 0)
             end_idx = torch.clip(env_current_episode_step, args.trxl_memory_length)
@@ -411,7 +420,7 @@ if __name__ == "__main__":
 
         # Flatten the batch
         b_obs = obs.reshape(-1, *obs.shape[2:])
-        b_logprobs = log_probs.reshape(-1, *log_probs.shape[2:])
+        b_logprobs = logprobs.reshape(-1, *logprobs.shape[2:])
         b_actions = actions.reshape(-1, *actions.shape[2:])
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
@@ -450,14 +459,19 @@ if __name__ == "__main__":
                 _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
                     b_obs[mb_inds], mb_memory_windows, b_memory_mask[mb_inds], b_memory_indices[mb_inds], b_actions[mb_inds]
                 )
+                logratio = newlogprob - b_logprobs[mb_inds]
+                ratio = logratio.exp()
+
+                with torch.no_grad():
+                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
                 mb_advantages = mb_advantages.unsqueeze(1).repeat(1, len(action_space_shape))
-
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = torch.exp(logratio)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
@@ -468,32 +482,35 @@ if __name__ == "__main__":
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + (newvalue - b_values[mb_inds]).clamp(
-                        -args.clip_coef, args.clip_coef
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds],
+                        -args.clip_coef,
+                        args.clip_coef,
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = v_loss_max.mean()
                 else:
                     v_loss = ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                # Reconstruction
-                r_loss = torch.tensor(0.0)
-                if agent.reconstruction_coef > 0.0:
-                    r_loss = bce_loss(agent.reconstruct_observation(), b_obs[mb_inds] / 255.0)
-                    loss += agent.reconstruction_coef * r_loss
+                reconstruction_loss = torch.tensor(0.0, device=device)
+                if args.reconstruction_coef > 0.0:
+                    predicted_obs = agent.reconstruct_observation()
+                    target_obs = b_obs[mb_inds].float() / 255.0
+                    assert predicted_obs.shape == target_obs.shape, (
+                        f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
+                    )
+                    reconstruction_loss = bce_loss(predicted_obs, target_obs)
+                    loss += args.reconstruction_coef * reconstruction_loss
+                writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
                 loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
-
-                with torch.no_grad():
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 # Append metrics for this minibatch
                 total_loss_list.append(loss.item())
@@ -508,7 +525,7 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-        
+
         # Compute means
         avg_total_loss = np.mean(total_loss_list)
         avg_pg_loss = np.mean(pg_loss_list)
@@ -538,7 +555,6 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", sps, global_step)
 
     if args.track and args.capture_video:
-        import wandb
         wandb.save(f"videos/{run_name}/*.mp4")
         wandb.save(f"videos/{run_name}/*.json")
         video_path = f"videos/{run_name}"
@@ -546,5 +562,5 @@ if __name__ == "__main__":
         for video_file in video_files:
             wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
 
-    writer.close()
     envs.close()
+    writer.close()

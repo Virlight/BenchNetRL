@@ -4,8 +4,9 @@ import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
 import numpy as np
+import wandb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
-    parser.add_argument("--gym-id", type=str, default="BreakoutNoFrameskip-v4",
+    parser.add_argument("--gym-id", type=str, default="ALE/Breakout-v5",
         help="the id of the gym environment")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,
         help="the learning rate of the optimizer")
@@ -68,7 +69,7 @@ def parse_args():
     parser.add_argument("--clip-coef", type=float, default=0.1,
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggle whether or not to use a clipped loss for the value function, as per the paper.")
+        help="Toggle whether or not to use a clipped loss for the value function")
     parser.add_argument("--ent-coef", type=float, default=0.01,
         help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=0.5,
@@ -77,6 +78,10 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--hidden-dim", type=int, default=512,
+        help="Size of the hidden dimension for CNN")
+    parser.add_argument("--reconstruction-coef", type=float, default=0.0,
+        help="Coefficient for optional observation reconstruction loss (0 disables it)")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -111,7 +116,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, args):
         super(Agent, self).__init__()
         self.network = nn.Sequential(
             layer_init(nn.Conv2d(4, 32, 8, stride=4)),
@@ -121,29 +126,46 @@ class Agent(nn.Module):
             layer_init(nn.Conv2d(64, 64, 3, stride=1)),
             nn.ReLU(),
             nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, 512)),
+            layer_init(nn.Linear(64 * 7 * 7, args.hidden_dim)),
             nn.ReLU(),
         )
-        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1)
+
+        if args.reconstruction_coef > 0:
+            self.transposed_cnn = nn.Sequential(
+                layer_init(nn.Linear(args.hidden_dim, 64 * 7 * 7)),
+                nn.ReLU(),
+                nn.Unflatten(1, (64, 7, 7)),
+                layer_init(nn.ConvTranspose2d(64, 64, 3, stride=1)),
+                nn.ReLU(),
+                layer_init(nn.ConvTranspose2d(64, 32, 4, stride=2)),
+                nn.ReLU(),
+                layer_init(nn.ConvTranspose2d(32, 1, 8, stride=4)),
+                nn.Sigmoid(),
+            )
+        self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1)
 
     def get_value(self, x):
         return self.critic(self.network(x / 255.0))
 
     def get_action_and_value(self, x, action=None):
         hidden = self.network(x / 255.0)
+        self.x = hidden
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+    
+    def reconstruct_observation(self):
+        x = self.transposed_cnn(self.x)
+        return x
 
 
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
-        import wandb
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -171,6 +193,7 @@ if __name__ == "__main__":
         raise RuntimeError("CUDA requested but not available on this system.")
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    torch.set_default_device(device)
 
     # Environment setup
     envs = gym.vector.SyncVectorEnv(
@@ -178,8 +201,9 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
 
     # Count and log parameters after agent initialization
     if args.track:
@@ -202,7 +226,8 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset(seed=[args.seed + i for i in range(args.num_envs)])[0]).to(device)
+    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
+    next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
@@ -336,6 +361,16 @@ if __name__ == "__main__":
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                reconstruction_loss = torch.tensor(0.0, device=device)
+                if args.reconstruction_coef > 0.0:
+                    predicted_obs = agent.reconstruct_observation()
+                    target_obs = b_obs[mb_inds].float() / 255.0
+                    assert predicted_obs.shape == target_obs.shape, (
+                        f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
+                    )
+                    reconstruction_loss = bce_loss(predicted_obs, target_obs)
+                    loss += args.reconstruction_coef * reconstruction_loss
                 writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
@@ -381,8 +416,9 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        sps = int(global_step / (time.time() - start_time))
+        print("SPS:", sps)
+        writer.add_scalar("charts/SPS", sps, global_step)
 
     if args.track and args.capture_video:
         wandb.save(f"videos/{run_name}/*.mp4")
@@ -391,6 +427,6 @@ if __name__ == "__main__":
         video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
         for video_file in video_files:
             wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
-    
+
     envs.close()
     writer.close()
