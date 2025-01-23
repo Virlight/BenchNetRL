@@ -2,6 +2,7 @@ import argparse
 import random
 import time
 from collections import deque
+from distutils.util import strtobool
 
 import gymnasium as gym
 import numpy as np
@@ -26,8 +27,16 @@ def parse_args():
         help="sequence length for Mamba model")
     parser.add_argument("--hidden-dim", type=int, default=128,
         help="Size of the hidden dimension for the Mamba model")
+    parser.add_argument("--use-mean-hidden", type=lambda x: bool(strtobool(x)), default=False,
+        help="If toggled, use the mean of all hidden states instead of the last hidden state.")
     parser.add_argument("--reconstruction-coef", type=float, default=0.0,
         help="Coefficient for optional observation reconstruction loss (0 disables it)")
+    parser.add_argument("--d-state", type=int, default=16,
+        help="State-space size for Mamba.")
+    parser.add_argument("--d-conv", type=int, default=4,
+        help="Convolutional projection size for Mamba.")
+    parser.add_argument("--expand", type=int, default=2,
+        help="Expansion factor in the Mamba state-space model.")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -72,9 +81,9 @@ class Agent(nn.Module):
         self.input_proj = layer_init(nn.Linear(512, args.hidden_dim))
         self.mamba = Mamba(
             d_model=args.hidden_dim,
-            d_state=16,
-            d_conv=4,
-            expand=2,
+            d_state=args.d_state,
+            d_conv=args.d_conv,
+            expand=args.expand,
         )
         self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1)
@@ -91,12 +100,12 @@ class Agent(nn.Module):
 
     def get_value(self, x):
         hidden = self.get_states(x)
-        last_hidden = hidden[:, -1, :]
+        last_hidden = hidden.mean(dim=1) if args.use_mean_hidden else hidden[:, -1, :]
         return self.critic(last_hidden)
 
     def get_action_and_value(self, x, action=None):
         hidden = self.get_states(x)
-        last_hidden = hidden[:, -1, :]
+        last_hidden = hidden.mean(dim=1) if args.use_mean_hidden else hidden[:, -1, :]
         self.x = last_hidden
         logits = self.actor(last_hidden)
         probs = Categorical(logits=logits)
@@ -105,6 +114,7 @@ class Agent(nn.Module):
         else:
             action = action.view(-1)
         return action, probs.log_prob(action), probs.entropy(), self.critic(last_hidden)
+    
     def reconstruct_observation(self):
         x = self.transposed_cnn(self.x)
         return x
@@ -142,6 +152,8 @@ if __name__ == "__main__":
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
+
+    rolling_episodic_returns = deque(maxlen=200)
 
     # Initialize observation buffers
     sequence_length = args.seq_len
@@ -221,6 +233,7 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episodic_return", avg_return, global_step)
                     writer.add_scalar("charts/episodic_length", avg_length, global_step)
 
+                    rolling_episodic_returns.append(avg_return)
         # bootstrap value if not done
         with torch.no_grad():
             obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])
@@ -372,4 +385,7 @@ if __name__ == "__main__":
         print("SPS:", sps)
         writer.add_scalar("charts/SPS", sps, global_step)
 
+    final_mean = np.mean(rolling_episodic_returns) if len(rolling_episodic_returns) > 0 else 0.0
+    with open("training_results.txt", "a") as f:
+        f.write(f"{args.gym_id} seed {args.seed} avg_return_last_x {final_mean}\n")
     finish_logging(args, writer, run_name, envs)
