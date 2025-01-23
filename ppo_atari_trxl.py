@@ -14,15 +14,8 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 from layers import Transformer
-
-# Import Atari wrappers
-from stable_baselines3.common.atari_wrappers import (
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-)
+from gae import compute_advantages
+from env_utils import make_atari_env
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -103,27 +96,6 @@ def parse_args():
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     return args
-
-def make_env(gym_id, seed, idx, capture_video, run_name):
-    def thunk():
-        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 1)
-        if capture_video and idx == 0:
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.reset(seed=seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        return env
-    return thunk
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -248,13 +220,12 @@ if __name__ == "__main__":
 
     if args.cuda and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available on this system.")
-
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     torch.set_default_device(device)
 
     # Environment setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, run_name, frame_stack=1) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
@@ -273,13 +244,11 @@ if __name__ == "__main__":
 
     agent = Agent(args, observation_space, action_space_shape, max_episode_steps).to(device)
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate)
-    bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
+    bce_loss = nn.BCELoss()
 
-    # Count and log parameters after agent initialization
     if args.track:
         total_params = sum(p.numel() for p in agent.parameters())
         trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-        
         wandb.config.update({
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
@@ -393,30 +362,10 @@ if __name__ == "__main__":
                 memory_mask[torch.clip(env_current_episode_step, 0, args.trxl_memory_length - 1)],
                 stored_memory_indices[-1],
             )
-            if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
-                lastgaelam = 0
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        nextvalues = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                returns = advantages + values
-            else:
-                returns = torch.zeros_like(rewards).to(device)
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        next_return = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        next_return = returns[t + 1]
-                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
-                advantages = returns - values
+            advantages, returns = compute_advantages(
+                rewards, values, dones, next_value, next_done,
+                args.gamma, args.gae_lambda, args.gae, args.num_steps, device
+            )
 
         # Flatten the batch
         b_obs = obs.reshape(-1, *obs.shape[2:])
@@ -505,7 +454,6 @@ if __name__ == "__main__":
                     )
                     reconstruction_loss = bce_loss(predicted_obs, target_obs)
                     loss += args.reconstruction_coef * reconstruction_loss
-                writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
                 optimizer.zero_grad()
                 loss.backward()
