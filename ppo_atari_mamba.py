@@ -331,7 +331,7 @@ if __name__ == "__main__":
                 reconstruction_loss = torch.tensor(0.0, device=device)
                 if args.reconstruction_coef > 0.0:
                     predicted_obs = agent.reconstruct_observation()
-                    target_obs = mb_obs.float() / 255.0
+                    target_obs = mb_obs[:, -1].float() / 255.0
                     assert predicted_obs.shape == target_obs.shape, (
                         f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
                     )
