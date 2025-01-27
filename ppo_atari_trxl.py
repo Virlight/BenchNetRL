@@ -16,6 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from layers import Transformer
 from gae import compute_advantages
 from env_utils import make_atari_env
+from exp_utils import add_common_args, setup_logging, finish_logging
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -113,42 +114,21 @@ def batched_index_select(input, dim, index):
 
 
 class Agent(nn.Module):
-    def __init__(self, args, observation_space, action_space_shape, max_episode_steps):
-        super().__init__()
-        self.obs_shape = observation_space.shape
+    def __init__(self, envs, args, max_episode_steps):
+        super(Agent, self).__init__()
         self.max_episode_steps = max_episode_steps
-
-        if len(self.obs_shape) > 1:
-            self.encoder = nn.Sequential(
-                layer_init(nn.Conv2d(3, 32, 8, stride=4)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-                nn.ReLU(),
-                nn.Flatten(),
-                layer_init(nn.Linear(64 * 7 * 7, args.trxl_dim)),
-                nn.ReLU(),
-            )
-        else:
-            self.encoder = layer_init(nn.Linear(observation_space.shape[0], args.trxl_dim))
-
-        self.transformer = Transformer(
-            args.trxl_num_layers, args.trxl_dim, args.trxl_num_heads, self.max_episode_steps, args.trxl_positional_encoding
-        )
-
-        self.hidden_post_trxl = nn.Sequential(
-            layer_init(nn.Linear(args.trxl_dim, args.trxl_dim)),
+        
+        self.network = nn.Sequential(
+            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(64 * 7 * 7, args.trxl_dim)),
             nn.ReLU(),
         )
-
-        self.actor_branches = nn.ModuleList(
-            [
-                layer_init(nn.Linear(args.trxl_dim, out_features=num_actions), np.sqrt(0.01))
-                for num_actions in action_space_shape
-            ]
-        )
-        self.critic = layer_init(nn.Linear(args.trxl_dim, 1), 1)
 
         if args.reconstruction_coef > 0:
             self.transposed_cnn = nn.Sequential(
@@ -159,28 +139,35 @@ class Agent(nn.Module):
                 nn.ReLU(),
                 layer_init(nn.ConvTranspose2d(64, 32, 4, stride=2)),
                 nn.ReLU(),
-                layer_init(nn.ConvTranspose2d(32, 3, 8, stride=4)),
+                layer_init(nn.ConvTranspose2d(32, 1, 8, stride=4)),
                 nn.Sigmoid(),
             )
+            
+        self.transformer = Transformer(
+            args.trxl_num_layers, args.trxl_dim, args.trxl_num_heads, self.max_episode_steps, args.trxl_positional_encoding
+        )
+
+        self.hidden_post_trxl = nn.Sequential(
+            layer_init(nn.Linear(args.trxl_dim, args.trxl_dim)),
+            nn.ReLU(),
+        )
+
+        self.actor = layer_init(nn.Linear(args.trxl_dim, envs.single_action_space.n), std=np.sqrt(0.01))
+        self.critic = layer_init(nn.Linear(args.trxl_dim, 1), std=1.0)
 
     def get_value(self, x, memory, memory_mask, memory_indices):
-        if len(self.obs_shape) > 1:
-            x = self.encoder(x.permute((0, 3, 1, 2)) / 255.0)
-        else:
-            x = self.encoder(x)
+        x = self.network(x / 255.0)
         x, _ = self.transformer(x, memory, memory_mask, memory_indices)
         x = self.hidden_post_trxl(x)
         return self.critic(x).flatten()
 
     def get_action_and_value(self, x, memory, memory_mask, memory_indices, action=None):
-        if len(self.obs_shape) > 1:
-            x = self.encoder(x.permute((0, 3, 1, 2)) / 255.0)
-        else:
-            x = self.encoder(x)
+        x = self.network(x / 255.0)
         x, memory = self.transformer(x, memory, memory_mask, memory_indices)
         x = self.hidden_post_trxl(x)
         self.x = x
-        probs = [Categorical(logits=branch(x)) for branch in self.actor_branches]
+        logits = self.actor(x)
+        probs = Categorical(logits=logits)
         if action is None:
             action = torch.stack([dist.sample() for dist in probs], dim=1)
         log_probs = [dist.log_prob(action[:, i]) for i, dist in enumerate(probs)]
@@ -193,24 +180,7 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % (
-            "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])
-        ),
-    )
+    writer, run_name = setup_logging(args)
 
     # Seeding
     random.seed(args.seed)
@@ -229,7 +199,6 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    observation_space = envs.single_observation_space
     action_space_shape = ((envs.single_action_space.n,) if isinstance(envs.single_action_space, gym.spaces.Discrete)
                           else tuple(envs.single_action_space.nvec))
 
@@ -242,7 +211,7 @@ if __name__ == "__main__":
         max_episode_steps = 1024
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
 
-    agent = Agent(args, observation_space, action_space_shape, max_episode_steps).to(device)
+    agent = Agent(envs, args, max_episode_steps).to(device)
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate)
     bce_loss = nn.BCELoss()
 
@@ -255,9 +224,9 @@ if __name__ == "__main__":
         }, allow_val_change=True)
 
     # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape))).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape), dtype=torch.long).to(device)
+    logprobs = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -438,9 +407,9 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = v_loss_max.mean()
+                    v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
@@ -502,13 +471,4 @@ if __name__ == "__main__":
         print("SPS:", sps)
         writer.add_scalar("charts/SPS", sps, global_step)
 
-    if args.track and args.capture_video:
-        wandb.save(f"videos/{run_name}/*.mp4")
-        wandb.save(f"videos/{run_name}/*.json")
-        video_path = f"videos/{run_name}"
-        video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
-        for video_file in video_files:
-            wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
-
-    envs.close()
-    writer.close()
+    finish_logging(args, writer, run_name, envs)
