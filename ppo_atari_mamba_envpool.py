@@ -163,7 +163,8 @@ if __name__ == "__main__":
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
 
-    rolling_episodic_returns = deque(maxlen=200)
+    model_size = sum(p.numel() for p in agent.parameters() if p.requires_grad) // 1_000
+    rolling_episodic_returns = deque(maxlen=800)
 
     # Initialize observation buffers
     sequence_length = args.seq_len
@@ -393,7 +394,11 @@ if __name__ == "__main__":
         print("SPS:", sps)
         writer.add_scalar("charts/SPS", sps, global_step)
 
-    final_mean = np.mean(rolling_episodic_returns) if len(rolling_episodic_returns) > 0 else 0.0
-    with open("training_results.txt", "a") as f:
-        f.write(f"{args.gym_id} seed {args.seed} avg_return_last_x {final_mean}\n")
+    final_mean = float(np.mean(rolling_episodic_returns)) if len(rolling_episodic_returns) > 0 else 0.0
+    results_txt = "training_results.txt"
+    with open(results_txt, "a") as f:
+        f.write(
+            f"{args.gym_id} seed {args.seed} model_size={model_size} "
+            f"avg_return_last_x {final_mean}\n"
+        )
     finish_logging(args, writer, run_name, envs)
