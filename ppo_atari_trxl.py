@@ -95,11 +95,12 @@ def parse_args():
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
     return args
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
+    if layer.bias is not None:
+        torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 def batched_index_select(input, dim, index):
@@ -169,14 +170,12 @@ class Agent(nn.Module):
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
-            action = torch.stack([dist.sample() for dist in probs], dim=1)
-        log_probs = [dist.log_prob(action[:, i]) for i, dist in enumerate(probs)]
-        entropies = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(-1)
-        return action, torch.stack(log_probs, dim=1), entropies, self.critic(x).flatten(), memory
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy(), self.critic(x).squeeze(-1), memory
 
     def reconstruct_observation(self):
         x = self.transposed_cnn(self.x)
-        return x.permute((0, 2, 3, 1))
+        return x
 
 if __name__ == "__main__":
     args = parse_args()
@@ -199,9 +198,6 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    action_space_shape = ((envs.single_action_space.n,) if isinstance(envs.single_action_space, gym.spaces.Discrete)
-                          else tuple(envs.single_action_space.nvec))
-
     env_current_episode_step = torch.zeros((args.num_envs,), dtype=torch.long)
     max_episode_steps = envs.envs[0].spec.max_episode_steps
     if not max_episode_steps:
@@ -212,7 +208,7 @@ if __name__ == "__main__":
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
 
     agent = Agent(envs, args, max_episode_steps).to(device)
-    optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     bce_loss = nn.BCELoss()
 
     if args.track:
@@ -225,8 +221,8 @@ if __name__ == "__main__":
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape), dtype=torch.long).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -241,6 +237,7 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    num_updates = args.total_timesteps // args.batch_size
     next_memory = torch.zeros((args.num_envs, max_episode_steps, args.trxl_num_layers, args.trxl_dim), dtype=torch.float32)
     memory_mask = torch.tril(torch.ones((args.trxl_memory_length, args.trxl_memory_length)), diagonal=-1)
 
@@ -253,12 +250,12 @@ if __name__ == "__main__":
     ).long()
     memory_indices = torch.cat((from_indices, to_indices))
 
-    for iteration in range(1, args.num_iterations + 1):
+    for update in range(1, num_updates + 1):
         sampled_episode_infos = []
-        do_anneal = args.anneal_lr and (args.total_timesteps > 0)  # or your own logic
-        steps_to_anneal = args.num_iterations * args.batch_size if not hasattr(args, "anneal_steps") else args.anneal_steps
+        do_anneal = args.anneal_lr and (args.total_timesteps > 0)
+        steps_to_anneal = num_updates * args.batch_size if not hasattr(args, "anneal_steps") else args.anneal_steps
         if steps_to_anneal <= 0:
-            steps_to_anneal = args.num_iterations * args.batch_size
+            steps_to_anneal = num_updates * args.batch_size
         frac = 1 - global_step / steps_to_anneal if do_anneal and global_step < steps_to_anneal else 0
         lr = (args.learning_rate - args.final_lr) * frac + args.final_lr
         for param_group in optimizer.param_groups:
@@ -389,7 +386,6 @@ if __name__ == "__main__":
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                mb_advantages = mb_advantages.unsqueeze(1).repeat(1, len(action_space_shape))
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio

@@ -6,6 +6,7 @@ videos/
 charts_episodic_return/
 checkpoints/
 *.csv
+*.yml
 
 # assets
 *.png

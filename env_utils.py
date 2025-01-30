@@ -1,4 +1,5 @@
 import gymnasium as gym
+import numpy as np
 from stable_baselines3.common.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
@@ -6,6 +7,30 @@ from stable_baselines3.common.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv,
 )
+
+class RecordEpisodeStatistics(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.num_envs = getattr(env, "num_envs", 1)
+        self.episode_returns = None
+        self.episode_lengths = None
+
+    def reset(self):
+        observations = self.env.reset()
+        self.episode_returns = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
+        return observations
+
+    def step(self, action):
+        observations, rewards, terminated, truncated, infos = self.env.step(action)
+        self.episode_returns += rewards
+        self.episode_lengths += 1
+        infos["r"] = self.episode_returns.copy()
+        infos["l"] = self.episode_lengths.copy()
+        done = np.logical_or(terminated, truncated)
+        self.episode_returns *= ~done
+        self.episode_lengths *= ~done
+        return observations, rewards, terminated, truncated, infos
 
 def make_atari_env(gym_id, seed, idx, capture_video, run_name, frame_stack=1):
     """

@@ -18,9 +18,11 @@ from exp_utils import add_common_args, setup_logging, finish_logging
 def parse_args():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
-
-    parser.add_argument("--hidden-dim", type=int, default=512,
-        help="Size of the hidden dimension for CNN")
+    
+    parser.add_argument("--rnn-type", type=str, default="lstm", choices=["lstm", "gru"],
+        help="Type of recurrent cell to use: 'lstm' or 'gru'")
+    parser.add_argument("--rnn-hidden-dim", type=int, default=128,
+        help="Size of the hidden dimension for the LSTM or GRU")
     parser.add_argument("--reconstruction-coef", type=float, default=0.0,
         help="Coefficient for optional observation reconstruction loss (0 disables it)")
     args = parser.parse_args()
@@ -38,21 +40,23 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs, args):
         super(Agent, self).__init__()
+        self.rnn_hidden_dim = args.rnn_hidden_dim
+
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
             nn.ReLU(),
             layer_init(nn.Conv2d(32, 64, 4, stride=2)),
             nn.ReLU(),
             layer_init(nn.Conv2d(64, 64, 3, stride=1)),
             nn.ReLU(),
             nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, args.hidden_dim)),
+            layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
 
         if args.reconstruction_coef > 0:
             self.transposed_cnn = nn.Sequential(
-                layer_init(nn.Linear(args.hidden_dim, 64 * 7 * 7)),
+                layer_init(nn.Linear(self.rnn_hidden_dim, 64 * 7 * 7)),
                 nn.ReLU(),
                 nn.Unflatten(1, (64, 7, 7)),
                 layer_init(nn.ConvTranspose2d(64, 64, 3, stride=1)),
@@ -62,20 +66,57 @@ class Agent(nn.Module):
                 layer_init(nn.ConvTranspose2d(32, 1, 8, stride=4)),
                 nn.Sigmoid(),
             )
-        self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1)
+        
+        if args.rnn_type == "lstm":
+            self.rnn = nn.LSTM(512, self.rnn_hidden_dim)
+        else:
+            self.rnn = nn.GRU(512, self.rnn_hidden_dim)
+        for name, param in self.rnn.named_parameters():
+            if "bias" in name:
+                nn.init.constant_(param, 0)
+            elif "weight" in name:
+                nn.init.orthogonal_(param, 1.0)
+        self.actor = layer_init(nn.Linear(self.rnn_hidden_dim, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(self.rnn_hidden_dim, 1), std=1.0)
 
-    def get_value(self, x):
-        return self.critic(self.network(x / 255.0))
-
-    def get_action_and_value(self, x, action=None):
+    def get_states(self, x, rnn_state, done):
         hidden = self.network(x / 255.0)
+
+        batch_size = rnn_state[0].shape[1] if args.rnn_type == "lstm" else rnn_state.shape[1]
+        hidden = hidden.reshape((-1, batch_size, self.rnn.input_size))
+
+        done = done.reshape((-1, batch_size))
+        new_hidden = []
+        for h_in, d in zip(hidden, done):
+            if args.rnn_type == "lstm":
+                h, c = rnn_state
+                h = (1.0 - d).view(1, -1, 1) * h
+                c = (1.0 - d).view(1, -1, 1) * c
+                out, (h, c) = self.rnn(h_in.unsqueeze(0), (h, c))
+                rnn_state = (h, c)
+            else:
+                # GRU
+                h = rnn_state
+                h = (1.0 - d).view(1, -1, 1) * h
+                out, h = self.rnn(h_in.unsqueeze(0), h)
+                rnn_state = h
+            new_hidden.append(out)
+
+        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+        return new_hidden, rnn_state
+
+    def get_value(self, x, rnn_state, done):
+        hidden, _ = self.get_states(x, rnn_state, done)
+        return self.critic(hidden)
+
+    def get_action_and_value(self, x, rnn_state, done, action=None):
+        hidden, rnn_state = self.get_states(x, rnn_state, done)
         self.x = hidden
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), rnn_state
     
     def reconstruct_observation(self):
         x = self.transposed_cnn(self.x)
@@ -102,7 +143,7 @@ if __name__ == "__main__":
         args.gym_id,
         env_type="gym",
         num_envs=args.num_envs,
-        stack_num=4,
+        stack_num=1,
         episodic_life=True,
         reward_clip=True,
         seed=args.seed,
@@ -138,9 +179,19 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset()
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+
+    if args.rnn_type == "lstm":
+        next_rnn_state = (
+            torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn_hidden_dim).to(device),
+            torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn_hidden_dim).to(device),
+        )
+    else:
+        next_rnn_state = torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn_hidden_dim).to(device)
+    
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(1, num_updates + 1):
+        initial_rnn_state = (next_rnn_state[0].clone(), next_rnn_state[1].clone()) if args.rnn_type == "lstm" else next_rnn_state.clone()
         # Annealing the learning rate
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -154,7 +205,7 @@ if __name__ == "__main__":
 
             # Action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value, next_rnn_state = agent.get_action_and_value(next_obs, next_rnn_state, next_done)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -178,7 +229,11 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(
+                next_obs,
+                next_rnn_state,
+                next_done,
+            ).reshape(1, -1)
             advantages, returns = compute_advantages(
                 rewards, values, dones, next_value, next_done,
                 args.gamma, args.gae_lambda, args.gae, args.num_steps, device
@@ -188,12 +243,16 @@ if __name__ == "__main__":
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_dones = dones.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        assert args.num_envs % args.num_minibatches == 0
+        envsperbatch = args.num_envs // args.num_minibatches
+        envinds = np.arange(args.num_envs)
+        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
         clipfracs = []
 
         # Initialize accumulators for metrics
@@ -207,12 +266,27 @@ if __name__ == "__main__":
         grad_norm_list = []
 
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(envinds)
+            for start in range(0, args.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                if args.rnn_type == "lstm":
+                    rnn_slice = (
+                        initial_rnn_state[0][:, mbenvinds],
+                        initial_rnn_state[1][:, mbenvinds],
+                    )
+                else:
+                    # GRU => single hidden state
+                    rnn_slice = initial_rnn_state[:, mbenvinds]
+
+                _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
+                    b_obs[mb_inds],
+                    rnn_slice,
+                    b_dones[mb_inds],
+                    b_actions.long()[mb_inds],
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
