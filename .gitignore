@@ -4,6 +4,8 @@ runs/
 wandb/
 videos/
 charts_episodic_return/
+checkpoints/
+*.csv
 
 # assets
 *.png

@@ -55,8 +55,8 @@ def run_experiment(params):
     game_seed_pairs = [
         ("ALE/Pong-v5", 1),
         ("ALE/Pong-v5", 2),
-        ("ALE/Pong-v5", 3),
-        ("ALE/Pong-v5", 4),
+        # ("ALE/Pong-v5", 3),
+        # ("ALE/Pong-v5", 4),
     ]
 
     learning_rate = params["learning_rate"]
@@ -78,7 +78,7 @@ def run_experiment(params):
         expand=expand
     )
     
-    total_timesteps = 10000000
+    total_timesteps = 4000000
     start_time = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = []
@@ -108,18 +108,19 @@ def run_experiment(params):
     total_time = end_time - start_time
     num_runs = len(game_seed_pairs)
     total_return = 0.0
+    total_solved_steps = 0.0
     if os.path.exists(results_file):
         with open(results_file, "r") as f:
             for line in f:
                 tokens = line.strip().split()
-                print(tokens)
                 try:
-                    final_return = float(tokens[-1])
-                    total_return += final_return
+                    token = float(tokens[-1])
+                    total_return += token
                 except ValueError:
                     pass
     
     avg_return = total_return / num_runs
+    avg_solved_steps = total_solved_steps / num_runs if num_runs > 0 else float(total_timesteps)
 
     csv_file = "carbs_runs_1.csv"
     file_exists = os.path.isfile(csv_file)
@@ -129,7 +130,7 @@ def run_experiment(params):
             writer.writerow([
                 "learning_rate", "reconstruction_coef", "ent_coef", "gamma",
                 "hidden_dim", "seq_len", "d_state", "d_conv", "expand",
-                "avg_return", "total_time_sec"
+                "avg_return", "model_size", "total_time_sec"
             ])
         writer.writerow([
             learning_rate,
@@ -142,6 +143,7 @@ def run_experiment(params):
             d_conv,
             expand,
             avg_return,
+            model_size,
             total_time
         ])
     return avg_return, float(model_size)
@@ -203,7 +205,7 @@ if __name__ == "__main__":
     )
     carbs = CARBS(carbs_params, param_spaces)
 
-    n_trials = 30
+    n_trials = 20
     for _ in range(n_trials):
         suggestion_obj = carbs.suggest()
         suggestion = suggestion_obj.suggestion
