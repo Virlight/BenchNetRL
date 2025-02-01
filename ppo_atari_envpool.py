@@ -102,10 +102,14 @@ if __name__ == "__main__":
         args.gym_id,
         env_type="gym",
         num_envs=args.num_envs,
-        stack_num=4,
+        #stack_num=4,
+        #frame_skip=4,
         episodic_life=True,
         reward_clip=True,
-        seed=args.seed,
+        #seed=args.seed,
+        repeat_action_probability=0.0,
+        #use_fire_reset=True,
+        #noop_max=30
     )
     envs.num_envs = args.num_envs
     envs.single_action_space = envs.action_space
