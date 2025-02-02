@@ -6,14 +6,16 @@ from collections import deque
 from distutils.util import strtobool
 
 import gymnasium as gym
+import wandb
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from torch.distributions import Categorical
-from torch.utils.tensorboard import SummaryWriter
 
+from gae import compute_advantages
+from exp_utils import setup_logging, finish_logging
 from layers import Transformer
 
 def parse_args():
@@ -212,23 +214,7 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    writer, run_name = setup_logging(args)
 
     # Seeding
     random.seed(args.seed)
@@ -238,7 +224,6 @@ if __name__ == "__main__":
 
     if args.cuda and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available on this system.")
-
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     torch.set_default_device(device)
 
@@ -269,7 +254,6 @@ if __name__ == "__main__":
     if args.track:
         total_params = sum(p.numel() for p in agent.parameters())
         trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-        import wandb
         wandb.config.update({
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
@@ -382,30 +366,10 @@ if __name__ == "__main__":
                 memory_mask[torch.clip(env_current_episode_step, 0, args.trxl_memory_length - 1)],
                 stored_memory_indices[-1],
             )
-            if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
-                lastgaelam = 0
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        nextvalues = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                returns = advantages + values
-            else:
-                returns = torch.zeros_like(rewards).to(device)
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        next_return = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        next_return = returns[t + 1]
-                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
-                advantages = returns - values
+            advantages, returns = compute_advantages(
+                rewards, values, dones, next_value, next_done,
+                args.gamma, args.gae_lambda, args.gae, args.num_steps, device
+            )
 
         # Flatten the batch
         b_obs = obs.reshape(-1, *obs.shape[2:])
@@ -535,14 +499,4 @@ if __name__ == "__main__":
         print("SPS:", sps)
         writer.add_scalar("charts/SPS", sps, global_step)
 
-    if args.track and args.capture_video:
-        import wandb
-        wandb.save(f"videos/{run_name}/*.mp4")
-        wandb.save(f"videos/{run_name}/*.json")
-        video_path = f"videos/{run_name}"
-        video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
-        for video_file in video_files:
-            wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
-
-    writer.close()
-    envs.close()
+    finish_logging(args, writer, run_name, envs)
