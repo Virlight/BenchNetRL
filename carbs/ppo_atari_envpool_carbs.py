@@ -1,6 +1,8 @@
 import argparse
 import random
 import time
+import envpool
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -11,7 +13,7 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 
 from gae import compute_advantages
-from env_utils import make_atari_env
+from env_utils import make_atari_env, RecordEpisodeStatistics
 from exp_utils import add_common_args, setup_logging, finish_logging
 
 def parse_args():
@@ -97,10 +99,23 @@ if __name__ == "__main__":
     torch.set_default_device(device)
 
     # Environment setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, run_name, frame_stack=4) for i in range(args.num_envs)]
+    envs = envpool.make(
+        args.gym_id,
+        env_type="gym",
+        num_envs=args.num_envs,
+        #stack_num=4,
+        #frame_skip=4,
+        episodic_life=True,
+        reward_clip=True,
+        seed=args.seed,
+        repeat_action_probability=0.0,
+        #use_fire_reset=True,
+        #noop_max=30
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    envs.num_envs = args.num_envs
+    envs.single_action_space = envs.action_space
+    envs.single_observation_space = envs.observation_space
+    envs = RecordEpisodeStatistics(envs)
 
     agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -113,6 +128,9 @@ if __name__ == "__main__":
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
+    
+    model_size = sum(p.numel() for p in agent.parameters() if p.requires_grad) // 1_000
+    rolling_episodic_returns = deque(maxlen=5000)
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -125,7 +143,7 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
+    next_obs, _ = envs.reset()
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
@@ -156,17 +174,16 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            final_info = info.get('final_info')
-            if final_info is not None and len(final_info) > 0:
-                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
-                if valid_entries:
-                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
-                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
-                    avg_return = float(f'{np.mean(episodic_returns):.3f}')
-                    avg_length = float(f'{np.mean(episodic_lengths):.3f}')
-                    print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
-                    writer.add_scalar("charts/episodic_return", avg_return, global_step)
-                    writer.add_scalar("charts/episodic_length", avg_length, global_step)
+            done_indices = np.where(done)[0]
+            if len(done_indices) > 0:
+                episodic_returns = info["r"][done_indices]
+                episodic_lengths = info["l"][done_indices]
+                avg_return = float(f"{np.mean(episodic_returns):.3f}")
+                avg_length = float(f"{np.mean(episodic_lengths):.3f}")
+                print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                writer.add_scalar("charts/episodic_return", avg_return, global_step)
+                writer.add_scalar("charts/episodic_length", avg_length, global_step)
+                rolling_episodic_returns.append(avg_return)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -244,7 +261,7 @@ if __name__ == "__main__":
                 reconstruction_loss = torch.tensor(0.0, device=device)
                 if args.reconstruction_coef > 0.0:
                     predicted_obs = agent.reconstruct_observation()
-                    target_obs = b_obs[mb_inds].float() / 255.0
+                    target_obs = b_obs[mb_inds][:, -1:, :, :].float() / 255.0
                     assert predicted_obs.shape == target_obs.shape, (
                         f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
                     )
@@ -264,6 +281,7 @@ if __name__ == "__main__":
                 grad_norm_list.append(grad_norm.item())
                 approx_kl_list.append(approx_kl.item())
                 old_approx_kl_list.append(old_approx_kl.item())
+                grad_norm_list.append(grad_norm.item())
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
@@ -296,5 +314,13 @@ if __name__ == "__main__":
         sps = int(global_step / (time.time() - start_time))
         print("SPS:", sps)
         writer.add_scalar("charts/SPS", sps, global_step)
+    
+    final_mean = float(np.mean(rolling_episodic_returns)) if len(rolling_episodic_returns) > 0 else 0.0
+    results_txt = "training_results_atari.txt"
+    with open(results_txt, "a") as f:
+        f.write(
+            f"{args.gym_id} seed={args.seed} model_size={int(model_size)} total_time={int(time.time() - start_time)} "
+            f"avg_return_last_x={final_mean:.3f}\n"
+        )
 
     finish_logging(args, writer, run_name, envs)

@@ -25,7 +25,7 @@ def parse_args():
 
     parser.add_argument("--seq-len", type=int, default=4,
         help="sequence length for Mamba model")
-    parser.add_argument("--hidden-dim", type=int, default=128,
+    parser.add_argument("--hidden-dim", type=int, default=256,
         help="Size of the hidden dimension for the Mamba model")
     parser.add_argument("--use-mean-hidden", type=lambda x: bool(strtobool(x)), default=False,
         help="If toggled, use the mean of all hidden states instead of the last hidden state.")

@@ -1,6 +1,9 @@
 import argparse
 import random
 import time
+import envpool
+from collections import deque
+from distutils.util import strtobool
 
 import gymnasium as gym
 import numpy as np
@@ -11,17 +14,30 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 
 from gae import compute_advantages
-from env_utils import make_atari_env
+from env_utils import make_atari_env, RecordEpisodeStatistics
 from exp_utils import add_common_args, setup_logging, finish_logging
+
+# Import Mamba
+from mamba_ssm import Mamba
 
 def parse_args():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
 
-    parser.add_argument("--hidden-dim", type=int, default=512,
-        help="Size of the hidden dimension for CNN")
+    parser.add_argument("--seq-len", type=int, default=4,
+        help="sequence length for Mamba model")
+    parser.add_argument("--hidden-dim", type=int, default=128,
+        help="Size of the hidden dimension for the Mamba model")
+    parser.add_argument("--use-mean-hidden", type=lambda x: bool(strtobool(x)), default=False,
+        help="If toggled, use the mean of all hidden states instead of the last hidden state.")
     parser.add_argument("--reconstruction-coef", type=float, default=0.0,
         help="Coefficient for optional observation reconstruction loss (0 disables it)")
+    parser.add_argument("--d-state", type=int, default=16,
+        help="State-space size for Mamba.")
+    parser.add_argument("--d-conv", type=int, default=4,
+        help="Convolutional projection size for Mamba.")
+    parser.add_argument("--expand", type=int, default=2,
+        help="Expansion factor in the Mamba state-space model.")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -37,15 +53,16 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs, args):
         super(Agent, self).__init__()
+
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
             nn.ReLU(),
             layer_init(nn.Conv2d(32, 64, 4, stride=2)),
             nn.ReLU(),
             layer_init(nn.Conv2d(64, 64, 3, stride=1)),
             nn.ReLU(),
             nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, args.hidden_dim)),
+            layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
 
@@ -61,20 +78,43 @@ class Agent(nn.Module):
                 layer_init(nn.ConvTranspose2d(32, 1, 8, stride=4)),
                 nn.Sigmoid(),
             )
+        
+        self.input_proj = layer_init(nn.Linear(512, args.hidden_dim))
+        self.mamba = Mamba(
+            d_model=args.hidden_dim,
+            d_state=args.d_state,
+            d_conv=args.d_conv,
+            expand=args.expand,
+        )
         self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1)
 
+    def get_states(self, x):
+        # x has shape (batch_size, seq_len, channels, height, width)
+        batch_size, seq_len = x.shape[0], x.shape[1]
+        x = x.contiguous().view(batch_size * seq_len, *x.shape[2:])  # Flatten sequence dimension
+        hidden = self.network(x / 255.0)  # Normalize pixel values
+        hidden = self.input_proj(hidden)
+        hidden = hidden.view(batch_size, seq_len, -1)
+        output = self.mamba(hidden)
+        return output
+
     def get_value(self, x):
-        return self.critic(self.network(x / 255.0))
+        hidden = self.get_states(x)
+        last_hidden = hidden.mean(dim=1) if args.use_mean_hidden else hidden[:, -1, :]
+        return self.critic(last_hidden)
 
     def get_action_and_value(self, x, action=None):
-        hidden = self.network(x / 255.0)
-        self.x = hidden
-        logits = self.actor(hidden)
+        hidden = self.get_states(x)
+        last_hidden = hidden.mean(dim=1) if args.use_mean_hidden else hidden[:, -1, :]
+        self.x = last_hidden
+        logits = self.actor(last_hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+        else:
+            action = action.view(-1)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(last_hidden)
     
     def reconstruct_observation(self):
         x = self.transposed_cnn(self.x)
@@ -97,10 +137,20 @@ if __name__ == "__main__":
     torch.set_default_device(device)
 
     # Environment setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, run_name, frame_stack=4) for i in range(args.num_envs)]
+    envs = envpool.make(
+        args.gym_id,
+        env_type="gym",
+        num_envs=args.num_envs,
+        stack_num=1,
+        episodic_life=True,
+        reward_clip=True,
+        seed=args.seed,
+        repeat_action_probability=0.0,
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    envs.num_envs = args.num_envs
+    envs.single_action_space = envs.action_space
+    envs.single_observation_space = envs.observation_space
+    envs = RecordEpisodeStatistics(envs)
 
     agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -114,8 +164,17 @@ if __name__ == "__main__":
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
 
+    model_size = sum(p.numel() for p in agent.parameters() if p.requires_grad) // 1_000
+    rolling_episodic_returns = deque(maxlen=3000)
+
+    # Initialize observation buffers
+    sequence_length = args.seq_len
+    obs_shape = (sequence_length,) + envs.single_observation_space.shape
+    obs_buffers = [deque(maxlen=sequence_length) for _ in range(args.num_envs)]
+    obs_dim = envs.single_observation_space.shape  # (channels, height, width)
+
     # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + obs_shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -125,10 +184,15 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
+    next_obs, _ = envs.reset()
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
+
+    # Initialize buffers
+    for i in range(args.num_envs):
+        for _ in range(sequence_length):
+            obs_buffers[i].append(next_obs[i].cpu().numpy())
 
     for update in range(1, num_updates + 1):
         # Annealing the learning rate
@@ -139,13 +203,21 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            obs[step] = next_obs
             dones[step] = next_done
+
+            # Update buffers
+            for i in range(args.num_envs):
+                obs_buffers[i].append(next_obs[i].cpu().numpy())
+
+            # Prepare sequences
+            obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])
+            obs_sequences = torch.tensor(obs_sequences, dtype=torch.float32).to(device)
+            obs[step] = obs_sequences
 
             # Action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                action, logprob, _, value = agent.get_action_and_value(obs_sequences)
+                values[step] = value.view(-1)
             actions[step] = action
             logprobs[step] = logprob
 
@@ -156,36 +228,44 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            final_info = info.get('final_info')
-            if final_info is not None and len(final_info) > 0:
-                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
-                if valid_entries:
-                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
-                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
-                    avg_return = float(f'{np.mean(episodic_returns):.3f}')
-                    avg_length = float(f'{np.mean(episodic_lengths):.3f}')
-                    print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
-                    writer.add_scalar("charts/episodic_return", avg_return, global_step)
-                    writer.add_scalar("charts/episodic_length", avg_length, global_step)
+            # Reset buffers for environments that are done
+            for i, d in enumerate(done):
+                if d:
+                    obs_buffers[i] = deque([next_obs[i].cpu().numpy()] * sequence_length, maxlen=sequence_length)
 
+            done_indices = np.where(done)[0]
+            if len(done_indices) > 0:
+                episodic_returns = info["r"][done_indices]
+                episodic_lengths = info["l"][done_indices]
+                avg_return = float(f"{np.mean(episodic_returns):.3f}")
+                avg_length = float(f"{np.mean(episodic_lengths):.3f}")
+                print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                writer.add_scalar("charts/episodic_return", avg_return, global_step)
+                writer.add_scalar("charts/episodic_length", avg_length, global_step)
+                rolling_episodic_returns.append(avg_return)
+        
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            obs_sequences = np.array([list(obs_buffers[i]) for i in range(args.num_envs)])
+            obs_sequences = torch.tensor(obs_sequences, dtype=torch.float32).to(device)
+            next_value = agent.get_value(obs_sequences).view(1, -1)
             advantages, returns = compute_advantages(
                 rewards, values, dones, next_value, next_done,
                 args.gamma, args.gae_lambda, args.gae, args.num_steps, device
             )
 
-        # Flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        # Flatten the batch but keep the sequence dimension
+        b_obs = obs.transpose(1, 0)  # Shape: (num_envs, num_steps, seq_len, channels, height, width)
+        b_logprobs = logprobs.transpose(1, 0)
+        b_actions = actions.transpose(1, 0)
+        b_advantages = advantages.transpose(1, 0)
+        b_returns = returns.transpose(1, 0)
+        b_values = values.transpose(1, 0)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        assert args.num_envs % args.num_minibatches == 0
+        envsperbatch = args.num_envs // args.num_minibatches
+        envinds = np.arange(args.num_envs)
         clipfracs = []
 
         # Initialize accumulators for metrics
@@ -199,13 +279,31 @@ if __name__ == "__main__":
         grad_norm_list = []
 
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(envinds)
+            for start in range(0, args.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                # Get sequences for the minibatch environments
+                mb_obs = b_obs[mbenvinds]
+                mb_actions = b_actions[mbenvinds]
+                mb_logprobs = b_logprobs[mbenvinds]
+                mb_advantages = b_advantages[mbenvinds]
+                mb_returns = b_returns[mbenvinds]
+                mb_values = b_values[mbenvinds]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
+                # Flatten batch and steps
+                mb_obs = mb_obs.reshape(-1, sequence_length, *obs_dim)
+                mb_actions = mb_actions.reshape(-1)
+                mb_logprobs = mb_logprobs.reshape(-1)
+                mb_advantages = mb_advantages.reshape(-1)
+                mb_returns = mb_returns.reshape(-1)
+                mb_values = mb_values.reshape(-1)
+
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, mb_actions.long())
+                newlogprob = newlogprob.view(-1)
+                entropy = entropy.view(-1)
+
+                logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
                 with torch.no_grad():
@@ -214,7 +312,6 @@ if __name__ == "__main__":
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
-                mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
@@ -226,17 +323,17 @@ if __name__ == "__main__":
                 # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_loss_unclipped = (newvalue - mb_returns) ** 2
+                    v_clipped = mb_values + torch.clamp(
+                        newvalue - mb_values,
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
@@ -244,7 +341,7 @@ if __name__ == "__main__":
                 reconstruction_loss = torch.tensor(0.0, device=device)
                 if args.reconstruction_coef > 0.0:
                     predicted_obs = agent.reconstruct_observation()
-                    target_obs = b_obs[mb_inds].float() / 255.0
+                    target_obs = mb_obs[:, -1].float() / 255.0
                     assert predicted_obs.shape == target_obs.shape, (
                         f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
                     )
@@ -264,6 +361,7 @@ if __name__ == "__main__":
                 grad_norm_list.append(grad_norm.item())
                 approx_kl_list.append(approx_kl.item())
                 old_approx_kl_list.append(old_approx_kl.item())
+                grad_norm_list.append(grad_norm.item())
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
@@ -297,4 +395,11 @@ if __name__ == "__main__":
         print("SPS:", sps)
         writer.add_scalar("charts/SPS", sps, global_step)
 
+    final_mean = float(np.mean(rolling_episodic_returns)) if len(rolling_episodic_returns) > 0 else 0.0
+    results_txt = "training_results.txt"
+    with open(results_txt, "a") as f:
+        f.write(
+            f"{args.gym_id} seed={args.seed} model_size={int(model_size)} total_time={int(time.time() - start_time)} "
+            f"avg_return_last_x={final_mean:.3f}\n"
+        )
     finish_logging(args, writer, run_name, envs)

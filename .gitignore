@@ -7,6 +7,8 @@ charts_episodic_return/
 checkpoints/
 *.csv
 *.yml
+model/
+*.pkl
 
 # assets
 *.png

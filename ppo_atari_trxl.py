@@ -38,7 +38,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="ppo-mamba",
+    parser.add_argument("--wandb-project-name", type=str, default="ppo-bench",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -46,7 +46,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--num-envs", type=int, default=16,
+    parser.add_argument("--num-envs", type=int, default=8,
         help="the number of parallel game environments")
     parser.add_argument("--num-steps", type=int, default=128,
         help="the number of steps to run in each environment per policy rollout")
@@ -54,13 +54,13 @@ def parse_args():
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gae", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Use GAE for advantage computation")
-    parser.add_argument("--gamma", type=float, default=0.995,
+    parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=8,
+    parser.add_argument("--num-minibatches", type=int, default=4,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=3,
+    parser.add_argument("--update-epochs", type=int, default=4,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle advantages normalization")
@@ -68,23 +68,23 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle whether or not to use a clipped loss for the value function")
-    parser.add_argument("--init-ent-coef", type=float, default=0.0001,
+    parser.add_argument("--init-ent-coef", type=float, default=0.015,
         help="initial entropy coefficient")
-    parser.add_argument("--final-ent-coef", type=float, default=0.000001,
+    parser.add_argument("--final-ent-coef", type=float, default=0.001,
         help="final entropy coefficient after annealing")
     parser.add_argument("--vf-coef", type=float, default=0.5,
         help="coefficient of the value function")
-    parser.add_argument("--max-grad-norm", type=float, default=0.25,
+    parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
 
     # Additional arguments for transformer
-    parser.add_argument("--trxl-num-layers", type=int, default=3,
+    parser.add_argument("--trxl-num-layers", type=int, default=1,
         help="the number of transformer layers")
-    parser.add_argument("--trxl-num-heads", type=int, default=4,
+    parser.add_argument("--trxl-num-heads", type=int, default=1,
         help="the number of heads used in multi-head attention")
-    parser.add_argument("--trxl-dim", type=int, default=384,
+    parser.add_argument("--trxl-dim", type=int, default=512,
         help="the dimension of the transformer")
     parser.add_argument("--trxl-memory-length", type=int, default=119,
         help="the length of TrXL's sliding memory window")
@@ -205,7 +205,7 @@ if __name__ == "__main__":
         max_episode_steps = None
     if not max_episode_steps:
         print("Warning: max_episode_steps not found in env spec. Using default of 512.")
-        max_episode_steps = 512
+        max_episode_steps = 256
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
 
     agent = Agent(envs, args, max_episode_steps).to(device)

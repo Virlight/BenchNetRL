@@ -106,7 +106,7 @@ if __name__ == "__main__":
         #frame_skip=4,
         episodic_life=True,
         reward_clip=True,
-        #seed=args.seed,
+        seed=args.seed,
         repeat_action_probability=0.0,
         #use_fire_reset=True,
         #noop_max=30

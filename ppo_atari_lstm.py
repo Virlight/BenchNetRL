@@ -196,7 +196,7 @@ if __name__ == "__main__":
             # Action logic
             with torch.no_grad():
                 action, logprob, _, value, next_rnn_state = agent.get_action_and_value(next_obs, next_rnn_state, next_done)
-                values[step] = value.flatten()
+                values[step] = value.view(-1)
             actions[step] = action
             logprobs[step] = logprob
 
@@ -218,7 +218,7 @@ if __name__ == "__main__":
                     print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
                     writer.add_scalar("charts/episodic_return", avg_return, global_step)
                     writer.add_scalar("charts/episodic_length", avg_length, global_step)
-
+        
         # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(
@@ -256,6 +256,7 @@ if __name__ == "__main__":
         approx_kl_list = []
         old_approx_kl_list = []
         grad_norm_list = []
+        reconstruction_loss_list = []
 
         for epoch in range(args.update_epochs):
             np.random.shuffle(envinds)
@@ -315,14 +316,15 @@ if __name__ == "__main__":
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                reconstruction_loss = torch.tensor(0.0, device=device)
                 if args.reconstruction_coef > 0.0:
+                    reconstruction_loss = torch.tensor(0.0, device=device)
                     predicted_obs = agent.reconstruct_observation()
                     target_obs = b_obs[mb_inds].float() / 255.0
                     assert predicted_obs.shape == target_obs.shape, (
                         f"Shape mismatch: predicted_obs {predicted_obs.shape} vs target_obs {target_obs.shape}"
                     )
                     reconstruction_loss = bce_loss(predicted_obs, target_obs)
+                    reconstruction_loss_list.append(reconstruction_loss.item())
                     loss += args.reconstruction_coef * reconstruction_loss
 
                 optimizer.zero_grad()
@@ -338,7 +340,6 @@ if __name__ == "__main__":
                 grad_norm_list.append(grad_norm.item())
                 approx_kl_list.append(approx_kl.item())
                 old_approx_kl_list.append(old_approx_kl.item())
-                grad_norm_list.append(grad_norm.item())
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
@@ -352,6 +353,9 @@ if __name__ == "__main__":
         avg_grad_norm = np.mean(grad_norm_list)
         avg_approx_kl = np.mean(approx_kl_list)
         avg_old_approx_kl = np.mean(old_approx_kl_list)
+        if args.reconstruction_coef > 0.0:
+            avg_reconstruction_loss = np.mean(reconstruction_loss_list)
+            writer.add_scalar("losses/reconstruction_loss", avg_reconstruction_loss, global_step)
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
