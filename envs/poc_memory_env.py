@@ -1,11 +1,13 @@
 from gym.spaces import space
 import numpy as np
-from gym import spaces
+#from gym import spaces
+from gymnasium import spaces
 import time
 import os
-from reprint import output
+#from reprint import output
 
 class PocMemoryEnv():
+    metadata = {"render_modes": [], "render_fps": 30}
     """
     Proof of Concept Memory Environment
 
@@ -56,7 +58,7 @@ class PocMemoryEnv():
         # Determine the goal
         self._goals = goals[np.random.permutation(2)]
         obs = np.asarray([self._goals[0], self._position, self._goals[1]], dtype=np.float32)
-        return obs
+        return obs, {}
 
     @property
     def observation_space(self):
@@ -89,9 +91,12 @@ class PocMemoryEnv():
         """
         reward = 0.0
         done = False
-        info = None
+        #info = None
         success = False
-        action = action[0]
+        if isinstance(action, (list, np.ndarray)):
+            action = action[0]
+        #action = action[0]
+        info = {}
         
         if self.max_episode_steps > 0 and self._step_count >= self.max_episode_steps - 1:
             done = True
@@ -106,7 +111,7 @@ class PocMemoryEnv():
             if self.freeze: # Check if agent is allowed to move
                 self._step_count += 1
                 self._rewards.append(reward)
-                return obs, reward, done, info
+                return obs, reward, done, False, info
 
         else:
             self._position += self._step_size if action == 1 else -self._step_size
@@ -135,15 +140,17 @@ class PocMemoryEnv():
         # Wrap up episode information
         if done:
             info = {"success": success,
-                    "reward": sum(self._rewards),
-                    "length": len(self._rewards)}
+                    "episode": {"r": sum(self._rewards),
+                                "l": len(self._rewards)},
+                    "r": sum(self._rewards),
+                    "l": len(self._rewards)}
         else:
-            info = None
+            info = {}
 
         # Increase step count
         self._step_count += 1
 
-        return obs, reward, done, info
+        return obs, reward, done, False, info
 
     def render(self):
         """

@@ -13,6 +13,7 @@ from torch.distributions.categorical import Categorical
 from gae import compute_advantages
 from env_utils import make_atari_env
 from exp_utils import add_common_args, setup_logging, finish_logging
+from layers import layer_init
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -26,12 +27,6 @@ def parse_args():
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    if layer.bias is not None:
-        torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
 
 
 class Agent(nn.Module):

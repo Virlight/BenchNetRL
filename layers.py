@@ -1,6 +1,13 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
+import numpy as np
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    if layer.bias is not None:
+        torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
 
 class PositionalEncoding(nn.Module):
     def __init__(self, dim, min_timescale=2.0, max_timescale=1e4):

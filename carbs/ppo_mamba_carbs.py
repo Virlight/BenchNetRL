@@ -27,29 +27,26 @@ def run_experiment(params):
     d_conv        = int(params["d_conv"])
     expand        = int(params["expand"])
 
-    total_timesteps = 100_000
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        futures = []
-        for (game, seed) in game_seed_pairs:
-            cmd = [
-                "python",
-                "ppo_atari_mamba_envpool.py",
-                f"--gym-id={game}",
-                f"--seed={seed}",
-                f"--learning-rate={learning_rate}",
-                f"--ent-coef={ent_coef}",
-                f"--gamma={gamma}",
-                f"--hidden-dim={hidden_dim}",
-                f"--seq-len={seq_len}",
-                f"--d-state={d_state}",
-                f"--d-conv={d_conv}",
-                f"--expand={expand}",
-                f"--total-timesteps={total_timesteps}",
-                "--num-steps=128",
-                f"--num-envs=16",
-            ]
-            futures.append(executor.submit(subprocess.run, cmd, check=True))
-        concurrent.futures.wait(futures)
+    total_timesteps = 10_000_000
+    for (game, seed) in game_seed_pairs:
+        cmd = [
+            "python",
+            "ppo_atari_mamba_envpool.py",
+            f"--gym-id={game}",
+            f"--seed={seed}",
+            f"--learning-rate={learning_rate}",
+            f"--ent-coef={ent_coef}",
+            f"--gamma={gamma}",
+            f"--hidden-dim={hidden_dim}",
+            f"--seq-len={seq_len}",
+            f"--d-state={d_state}",
+            f"--d-conv={d_conv}",
+            f"--expand={expand}",
+            f"--total-timesteps={total_timesteps}",
+            "--num-steps=128",
+            f"--num-envs=16",
+        ]
+        subprocess.run(cmd, check=True)
 
     num_runs = len(game_seed_pairs)
     total_return = 0.0
@@ -127,7 +124,7 @@ if __name__ == "__main__":
     else:
         carbs = CARBS(carbs_params, param_spaces)
 
-    n_trials = 3
+    n_trials = 2
     for _ in range(n_trials):
         suggestion_obj = carbs.suggest()
         suggestion = suggestion_obj.suggestion

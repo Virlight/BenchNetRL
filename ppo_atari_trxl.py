@@ -11,9 +11,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
-from torch.utils.tensorboard import SummaryWriter
 
-from layers import Transformer
+from layers import Transformer, layer_init
 from gae import compute_advantages
 from env_utils import make_atari_env
 from exp_utils import add_common_args, setup_logging, finish_logging
@@ -96,12 +95,6 @@ def parse_args():
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    if layer.bias is not None:
-        torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
 
 def batched_index_select(input, dim, index):
     for ii in range(1, len(input.shape)):

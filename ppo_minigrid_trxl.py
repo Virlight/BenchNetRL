@@ -11,10 +11,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from torch.distributions import Categorical
 
 from gae import compute_advantages
+from env_utils import make_minigrid_env, make_atari_env, make_poc_env
 from exp_utils import setup_logging, finish_logging
 from layers import Transformer
 
@@ -99,25 +99,6 @@ def parse_args():
     args.num_iterations = args.total_timesteps // args.batch_size
     return args
 
-def make_env(gym_id, seed, idx, capture_video, run_name):
-    def thunk():
-        env = gym.make(
-            gym_id,
-            agent_view_size=3,
-            tile_size=28,
-            render_mode="rgb_array" if capture_video else None,
-        )
-        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=28))
-        env = gym.wrappers.TimeLimit(env, 96)
-        if capture_video and idx == 0:
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env.reset(seed=seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        return env
-    return thunk
-
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     return layer
@@ -148,7 +129,7 @@ class Agent(nn.Module):
                 layer_init(nn.Conv2d(64, 64, 3, stride=1)),
                 nn.ReLU(),
                 nn.Flatten(),
-                layer_init(nn.Linear(64 * 7 * 7, args.trxl_dim)),
+                layer_init(nn.Linear(64 * 2 * 2, args.trxl_dim)),
                 nn.ReLU(),
             )
         else:

@@ -1,48 +1,24 @@
 import argparse
+import os
 import random
 import time
+from distutils.util import strtobool
 
 import gymnasium as gym
-import numpy as np
 import wandb
-import minigrid
-from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 
+from mamba_ssm import Mamba
+
 from gae import compute_advantages
-from env_utils import make_atari_env
-from exp_utils import add_common_args, setup_logging, finish_logging
+from env_utils import make_minigrid_env, make_atari_env, make_poc_env
+from exp_utils import setup_logging, finish_logging, add_common_args
 
-from envs.poc_memory_env import PocMemoryEnv
-
-def make_env_poc(gym_id, seed, idx, capture_video, run_name):
-    def thunk():
-        env = PocMemoryEnv(step_size=0.2, glob=False, freeze=False, max_episode_steps=96)
-        return env
-    return thunk
-
-def make_env(gym_id, seed, idx, capture_video, run_name):
-    def thunk():
-        env = gym.make(
-            gym_id,
-            agent_view_size=3,
-            tile_size=16,
-            render_mode="rgb_array" if capture_video else None,
-        )
-        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=16))
-        env = gym.wrappers.TimeLimit(env, 96)
-        if capture_video and idx == 0:
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env.reset(seed=seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        return env
-    return thunk
-
+# Add a new argument for episodic memory length
 def parse_args():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
@@ -50,7 +26,7 @@ def parse_args():
         help="Size of the hidden dimension for CNN")
     parser.add_argument("--memory-length", type=int, default=4,
         help="Number of past hidden states to use as episodic memory")
-    parser.add_argument("--d-state", type=int, default=16,
+    parser.add_argument("--d-state", type=int, default=64,
         help="State-space size for Mamba")
     parser.add_argument("--d-conv", type=int, default=4,
         help="Convolutional projection size for Mamba")
@@ -78,15 +54,14 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 #
 # During rollout the per-env memory is stored in a buffer and reset on episode termination.
 # In training, the stored memory windows (already detached) are passed along with observations.
-#
-from mamba_ssm import Mamba
 
 class Agent(nn.Module):
     def __init__(self, envs, args):
         super(Agent, self).__init__()
         self.hidden_dim = args.hidden_dim
-        self.memory_length = args.memory_length
+        self.memory_length = args.memory_length  # episodic memory window length
 
+        # CNN encoder: same as before.
         self.encoder = nn.Sequential(
             layer_init(nn.Conv2d(3, 32, 8, stride=4)),
             nn.ReLU(),
@@ -117,7 +92,7 @@ class Agent(nn.Module):
             expand=args.expand,
         )
 
-        # Actor and critic heads
+        # Actor and critic heads.
         self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1)
 
@@ -125,27 +100,34 @@ class Agent(nn.Module):
         """
         x: current observation (B, obs_dim)
         memory_window: (B, memory_length, hidden_dim)
+        step: current time step (an integer or tensor scalar); if provided, used to decide whether to detach
+        truncation_interval: allow gradient flow for this many steps before truncating
         """
         B = x.shape[0]
         x_enc = self.encoder(x) 
+        #x_enc = self.encoder(x.permute((0, 3, 1, 2)) / 255.0)  # (B, hidden_dim)
         x_token = x_enc.unsqueeze(1)  # (B, 1, hidden_dim)
 
-        # If no memory, initialize it to zeros
+        # If no memory is provided, initialize it to zeros.
         if memory_window is None:
             memory_window = torch.zeros(B, self.memory_length, self.hidden_dim, device=x.device)
+        # Here, we do not detach the entire memory_window—so that past tokens can keep their gradients
+        # (or you could decide to detach only if they are older than a threshold).
+
+        # Concatenate memory window with current token.
         seq = torch.cat([memory_window, x_token], dim=1)  # (B, memory_length+1, hidden_dim)
 
-        # Process the sequence through Mamba
+        # Process the sequence through Mamba.
         out_seq = self.mamba(seq)  # (B, memory_length+1, hidden_dim)
-        current_repr = out_seq[:, -1, :]  # Use the last token as the current representation
+        current_repr = out_seq[:, -1, :]  # Use the last token as the current representation.
 
+        # Compute policy logits and value.
         logits = self.actor(current_repr)
         value = self.critic(current_repr).flatten()
 
-        # Not sure about detaching
-        new_token = current_repr#.detach() 
+        new_token = current_repr.detach()  # Detach the current token for the memory window.
 
-        # Shift the memory window and append the new token.
+        # Update memory: shift the memory window and append the new token.
         new_memory = torch.cat([memory_window[:, 1:], new_token.unsqueeze(1)], dim=1)
         return logits, value, new_memory, current_repr
 
@@ -177,7 +159,7 @@ if __name__ == "__main__":
 
     # Environment setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env_poc(args.gym_id, args.seed + i, i, args.capture_video, run_name)
+        [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, run_name)
          for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
@@ -193,7 +175,7 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    # For storing the memory window used at each step
+    # New buffer for storing the memory window used at each step.
     stored_memories = torch.zeros((args.num_steps, args.num_envs, agent.memory_length, args.hidden_dim), device=device)
 
     # --- Start the game ---
@@ -202,9 +184,8 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-    # Initialize per-env episodic memory
+    # Initialize per-env episodic memory (for the Mamba memory window)
     next_memory = torch.zeros((args.num_envs, agent.memory_length, args.hidden_dim), device=device)
-    
     num_updates = args.total_timesteps // args.batch_size
     from collections import deque
     episode_infos = deque(maxlen=100)
@@ -220,23 +201,24 @@ if __name__ == "__main__":
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
-            
+            # Save the current memory window for this step.
             stored_memories[step] = next_memory#.detach()
 
+            # Action logic with memory:
             with torch.no_grad():
                 action, logprob, entropy, value, new_memory = agent.get_action_and_value(next_obs, next_memory)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # Execute the game step
+            # Execute the game step.
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            # For any environment where an episode ended, reset its memory
+            # For any environment where an episode ended, reset its memory.
             for i, d in enumerate(next_done):
                 if d.item():
                     next_memory[i] = torch.zeros(agent.memory_length, args.hidden_dim, device=device)
@@ -254,8 +236,8 @@ if __name__ == "__main__":
                     avg_return = float(f'{np.mean(episodic_returns):.3f}')
                     avg_length = float(f'{np.mean(episodic_lengths):.3f}')
                     #print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
-                    writer.add_scalar("charts/episodic_return", avg_return, global_step)
-                    writer.add_scalar("charts/episodic_length", avg_length, global_step)
+                    writer.add_scalar("charts/episode_return", avg_return, global_step)
+                    writer.add_scalar("charts/episode_length", avg_length, global_step)
 
         # --- Bootstrap value with memory ---
         with torch.no_grad():
@@ -308,7 +290,7 @@ if __name__ == "__main__":
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
+                # Policy loss (PPO clipped objective)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()

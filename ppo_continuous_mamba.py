@@ -12,10 +12,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
-from mamba_ssm import Mamba
 
 from gae import compute_advantages
 from exp_utils import setup_logging, finish_logging
+from layers import layer_init
+from mamba_ssm import Mamba
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -96,12 +97,6 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         env.observation_space.seed(seed)
         return env
     return thunk
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    if layer.bias is not None:
-        torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
 
 class Agent(nn.Module):
     def __init__(self, envs):

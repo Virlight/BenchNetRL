@@ -7,6 +7,9 @@ from stable_baselines3.common.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv,
 )
+import minigrid
+from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
+from envs.poc_memory_env import PocMemoryEnv
 
 class RecordEpisodeStatistics(gym.Wrapper):
   def __init__(self, env, deque_size=100):
@@ -56,9 +59,6 @@ class RecordEpisodeStatistics(gym.Wrapper):
     )
 
 def make_atari_env(gym_id, seed, idx, capture_video, run_name, frame_stack=1):
-    """
-    frame_stack: How many frames to stack for the observation.
-    """
     def thunk():
         env = gym.make(gym_id, render_mode="rgb_array", repeat_action_probability=0.0) if capture_video else gym.make(gym_id, repeat_action_probability=0.0)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -76,5 +76,59 @@ def make_atari_env(gym_id, seed, idx, capture_video, run_name, frame_stack=1):
         env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
+        return env
+    return thunk
+
+def make_classic_env(gym_id, seed, idx, capture_video, run_name):
+    def thunk():
+        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        env.reset(seed=seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+    return thunk
+
+def make_memory_gym_env(gym_id, seed, idx, capture_video, run_name):
+    def thunk():
+        import memory_gym
+        env = gym.make(
+            gym_id,
+            render_mode="rgb_array" if capture_video else None,
+        )
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.reset(seed=seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+
+    return thunk
+
+def make_minigrid_env(gym_id, seed, idx, capture_video, run_name, agent_view_size=3, tile_size=16, max_episode_steps=96):
+    def thunk():
+        env = gym.make(
+            gym_id,
+            agent_view_size=agent_view_size,
+            tile_size=tile_size,
+            render_mode="rgb_array" if capture_video else None,
+        )
+        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=tile_size))
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.reset(seed=seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+    return thunk
+
+def make_poc_env(gym_id, seed, idx, capture_video, run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96):
+    def thunk():
+        env = PocMemoryEnv(step_size=step_size, glob=glob, freeze=freeze, max_episode_steps=max_episode_steps)
         return env
     return thunk
