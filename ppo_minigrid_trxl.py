@@ -16,7 +16,7 @@ from torch.distributions import Categorical
 from gae import compute_advantages
 from env_utils import make_minigrid_env, make_atari_env, make_poc_env
 from exp_utils import setup_logging, finish_logging
-from layers import Transformer
+from layers import Transformer, batched_index_select, layer_init
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -98,20 +98,6 @@ def parse_args():
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     return args
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    return layer
-
-def batched_index_select(input, dim, index):
-    for ii in range(1, len(input.shape)):
-        if ii != dim:
-            index = index.unsqueeze(ii)
-    expanse = list(input.shape)
-    expanse[0] = -1
-    expanse[dim] = -1
-    index = index.expand(expanse)
-    return torch.gather(input, dim, index)
 
 
 class Agent(nn.Module):

@@ -4,112 +4,77 @@ import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
+import wandb
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
-from torch.utils.tensorboard import SummaryWriter
+from collections import deque
+
+from gae import compute_advantages
+from exp_utils import add_common_args, setup_logging, finish_logging
+from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env
+from layers import layer_init
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
-        help="the name of this experiment")
-    parser.add_argument("--gym-id", type=str, default="CartPole-v1",
-        help="the id of the gym environment")
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
-        help="the learning rate of the optimizer")
-    parser.add_argument("--seed", type=int, default=1,
-        help="seed of the experiment")
-    parser.add_argument("--total-timesteps", type=int, default=25000,
-        help="total timesteps of the experiments")
-    parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="if toggled, `torch.backends.cudnn.deterministic=False`")
-    parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="if toggled, cuda will be enabled by default")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="ppo-mamba",
-        help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
-        help="the entity (team) of wandb's project")
-    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to capture videos of the agent performances (check out `videos` folder)")
-
-    # Algorithm specific arguments
-    parser.add_argument("--num-envs", type=int, default=4,
-        help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=128,
-        help="the number of steps to run in each environment per policy rollout")
-    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--gae", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Use GAE for advantage computation")
-    parser.add_argument("--gamma", type=float, default=0.99,
-        help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.95,
-        help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=4,
-        help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=4,
-        help="the K epochs to update the policy")
-    parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggles advantages normalization")
-    parser.add_argument("--clip-coef", type=float, default=0.2,
-        help="the surrogate clipping coefficient")
-    parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
-    parser.add_argument("--ent-coef", type=float, default=0.01,
-        help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.5,
-        help="coefficient of the value function")
-    parser.add_argument("--max-grad-norm", type=float, default=0.5,
-        help="the maximum norm for the gradient clipping")
-    parser.add_argument("--target-kl", type=float, default=None,
-        help="the target KL divergence threshold")
+    add_common_args(parser)
     args = parser.parse_args()
+    args.exp_name = os.path.basename(__file__).rstrip(".py")
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
 
-
-def make_env(gym_id, seed, idx, capture_video, run_name):
-    def thunk():
-        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        if capture_video and idx == 0:
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.reset(seed=seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        return env
-    return thunk
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, args):
         super(Agent, self).__init__()
-        self.network = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
+        self.obs_space = envs.single_observation_space
+        if len(self.obs_space.shape) == 3:  # image observation
+            self.encoder = nn.Sequential(
+                layer_init(nn.Conv2d(self.obs_space.shape[2], 32, 8, stride=4)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+                nn.ReLU(),
+                nn.Flatten(),
+                layer_init(nn.Linear(64 * 2 * 2, args.hidden_dim)),
+                nn.ReLU(),
+            )
+        else:  # vector observation
+            input_dim = np.prod(self.obs_space.shape)
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(input_dim, args.hidden_dim),
+                nn.ReLU(),
+            )
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(args.hidden_dim, args.hidden_dim // 2)),
+            nn.ReLU(),
+            layer_init(nn.Linear(args.hidden_dim // 2, 1), std=1.0),
         )
-        self.actor = layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(64, 1), std=1)
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(args.hidden_dim, args.hidden_dim // 2)),
+            nn.ReLU(),
+            layer_init(nn.Linear(args.hidden_dim // 2, envs.single_action_space.n), std=0.01),
+        )
+    
+    def get_states(self, x, rnn_state, done):
+        if "minigrid" in args.gym_id.lower():
+            x = x.permute((0, 3, 1, 2)) / 255.0
+        if "ale" in args.gym_id.lower():
+            x = x / 255.0
+        hidden = self.encoder(x)
+        return hidden
 
     def get_value(self, x):
-        return self.critic(self.network(x))
+        hidden = self.get_states(x)
+        return self.critic(hidden)
 
     def get_action_and_value(self, x, action=None):
-        hidden = self.network(x)
+        hidden = self.get_states(x)
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
@@ -119,24 +84,7 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    writer, run_name = setup_logging(args)
 
     # Seeding
     random.seed(args.seed)
@@ -146,27 +94,39 @@ if __name__ == "__main__":
 
     if args.cuda and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available on this system.")
-
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    torch.set_default_device(device)
 
-    # Env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
-    )
+    # Environment setup
+    if "ale" in args.gym_id.lower():
+        envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
+                                   run_name, frame_stack=4) for i in range(args.num_envs)]
+    elif "minigrid" in args.gym_id.lower():
+        envs_lst = [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, 
+                                      run_name, agent_view_size=3, tile_size=16, max_episode_steps=96) for i in range(args.num_envs)]
+    elif "poc" in args.gym_id.lower():
+        envs_lst = [make_poc_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                 run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96) for i in range(args.num_envs)]
+    elif args.gym_id == "MortarMayhem-Grid-v0":
+        envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                        run_name) for i in range(args.num_envs)]
+    else:
+        envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
+                                     run_name) for i in range(args.num_envs)]
+    envs = gym.vector.SyncVectorEnv(envs_lst)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # Count and log parameters after agent initialization
+    total_params = sum(p.numel() for p in agent.parameters())
+    trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
     if args.track:
-        total_params = sum(p.numel() for p in agent.parameters())
-        trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-        
         wandb.config.update({
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
+    print(f"Total parameters: {total_params / 10e6:.4f}M, trainable parameters: {trainable_params / 10e6:.4f}M")
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -179,7 +139,9 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset(seed=[args.seed + i for i in range(args.num_envs)])[0]).to(device)
+    episode_infos = deque(maxlen=100)
+    next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
+    next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
@@ -191,7 +153,7 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
-            global_step += 1 * args.num_envs
+            global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
 
@@ -206,8 +168,9 @@ if __name__ == "__main__":
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
-            
+            next_obs = torch.Tensor(next_obs).to(device)
+            next_done = torch.Tensor(done).to(device)
+
             if 'final_info' in info:
                 final_info_array = np.array(info['final_info'])
                 valid_indices = np.where(final_info_array != None)[0]
@@ -216,39 +179,19 @@ if __name__ == "__main__":
                 episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
                 avg_return = float(f'{np.round(np.mean(episodic_returns), 3):.3f}')
                 avg_length = float(f'{np.round(np.mean(episodic_lengths), 3):.3f}')
-                print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
-                writer.add_scalar("charts/episodic_return", avg_return, global_step)
-                writer.add_scalar("charts/episodic_length", avg_length, global_step)
+                episode_infos.append({'r': avg_return, 'l': avg_length})
+                writer.add_scalar("charts/episode_return", avg_return, global_step)
+                writer.add_scalar("charts/episode_length", avg_length, global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
-            if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
-                lastgaelam = 0
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        nextvalues = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                returns = advantages + values
-            else:
-                returns = torch.zeros_like(rewards).to(device)
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        next_return = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        next_return = returns[t + 1]
-                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
-                advantages = returns - values
+            advantages, returns = compute_advantages(
+                rewards, values, dones, next_value, next_done,
+                args.gamma, args.gae_lambda, args.gae, args.num_steps, device
+            )
 
-        # flatten the batch
+        # Flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -326,12 +269,11 @@ if __name__ == "__main__":
                 grad_norm_list.append(grad_norm.item())
                 approx_kl_list.append(approx_kl.item())
                 old_approx_kl_list.append(old_approx_kl.item())
-                grad_norm_list.append(grad_norm.item())
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-        
+
         # Compute means
         avg_total_loss = np.mean(total_loss_list)
         avg_pg_loss = np.mean(pg_loss_list)
@@ -345,7 +287,10 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # Record rewards for plotting purposes
+        sps = int(global_step / (time.time() - start_time))
+        print(f"Update {update}: SPS={sps}, Return={np.mean([ep['r'] for ep in episode_infos]) if episode_infos else 0:.2f}, "
+              f"pi_loss={pg_loss.item():.6f}, v_loss={v_loss.item():.6f}, entropy={entropy_loss.item():.6f}, "
+              f"explained_var={explained_var:.6f}")
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/total_loss", avg_total_loss, global_step)
         writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
@@ -356,16 +301,5 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-    if args.track and args.capture_video:
-        wandb.save(f"videos/{run_name}/*.mp4")
-        wandb.save(f"videos/{run_name}/*.json")
-        video_path = f"videos/{run_name}"
-        video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.gif'))]
-        for video_file in video_files:
-            wandb.log({"video": wandb.Video(os.path.join(video_path, video_file), fps=4, format="mp4")})
-
-    envs.close()
-    writer.close()
+        writer.add_scalar("charts/SPS", sps, global_step)
+    finish_logging(args, writer, run_name, envs)
