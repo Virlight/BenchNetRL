@@ -25,6 +25,8 @@ def parse_args():
         help="the hidden dimension of the model")
     parser.add_argument("--rnn-type", type=str, default="lstm", choices=["lstm", "gru"],
         help="Type of recurrent cell to use: 'lstm' or 'gru'")
+    parser.add_argument("--rnn-hidden-dim", type=int, default=512,
+        help="the hidden dimension of the rnn")
     args = parser.parse_args()
     args.exp_name = os.path.basename(__file__).rstrip(".py")
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -36,44 +38,50 @@ class Agent(nn.Module):
         super(Agent, self).__init__()
         self.obs_space = envs.single_observation_space
         self.rnn_type = args.rnn_type
+        self.args = args
+        #print(f"Observation space: {self.obs_space.shape}")
         if len(self.obs_space.shape) == 3:  # image observation
+            if self.obs_space.shape[0] in [1, 3]:
+                in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
+            else:
+                in_channels = self.obs_space.shape[2]
             self.encoder = nn.Sequential(
-                layer_init(nn.Conv2d(self.obs_space.shape[2], 32, 8, stride=4)),
+                layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
                 nn.ReLU(),
                 layer_init(nn.Conv2d(32, 64, 4, stride=2)),
                 nn.ReLU(),
                 layer_init(nn.Conv2d(64, 64, 3, stride=1)),
                 nn.ReLU(),
                 nn.Flatten(),
-                layer_init(nn.Linear(64 * 2 * 2, args.hidden_dim)),
+                layer_init(nn.Linear(64 * 7 * 7, self.args.hidden_dim)),
                 nn.ReLU(),
             )
         else:  # vector observation
             input_dim = np.prod(self.obs_space.shape)
             self.encoder = nn.Sequential(
                 nn.Flatten(),
-                nn.Linear(input_dim, args.hidden_dim),
+                nn.Linear(input_dim, self.args.hidden_dim),
                 nn.ReLU(),
             )
         
         if self.rnn_type == "lstm":
-            self.rnn = nn.LSTM(args.hidden_dim, args.hidden_dim)
+            self.rnn = nn.LSTM(self.args.hidden_dim, self.args.rnn_hidden_dim)
         else:
-            self.rnn = nn.GRU(args.hidden_dim, args.hidden_dim)
+            self.rnn = nn.GRU(self.args.hidden_dim, self.args.rnn_hidden_dim)
         for name, param in self.rnn.named_parameters():
             if "bias" in name:
                 nn.init.constant_(param, 0)
             elif "weight" in name:
                 nn.init.orthogonal_(param, 1.0)
 
-        self.ln = nn.LayerNorm(args.hidden_dim)
-        self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1.0)
+        self.ln = nn.LayerNorm(self.args.rnn_hidden_dim)
+        self.actor = layer_init(nn.Linear(self.args.rnn_hidden_dim, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(self.args.rnn_hidden_dim, 1), std=1.0)
 
     def get_states(self, x, rnn_state, done):
-        if "minigrid" in args.gym_id.lower():
-            x = x.permute((0, 3, 1, 2)) / 255.0
-        if "ale" in args.gym_id.lower():
+        if "minigrid" in self.args.gym_id.lower() or "mortar" in self.args.gym_id.lower():
+            x = x.permute(0, 3, 1, 2) / 255.0
+        if "ale/" in self.args.gym_id.lower():
             x = x / 255.0
         hidden = self.encoder(x)
         if self.rnn_type == "lstm":
@@ -100,7 +108,7 @@ class Agent(nn.Module):
                     (1.0 - d).view(1, -1, 1) * rnn_state,
                 )
                 new_hidden.append(h)
-        new_hidden = torch.cat(new_hidden, dim=0).reshape(-1, args.hidden_dim)
+        new_hidden = torch.cat(new_hidden, dim=0).reshape(-1, self.args.rnn_hidden_dim)
         new_hidden = self.ln(new_hidden)
         return new_hidden, rnn_state
 
@@ -137,7 +145,7 @@ if __name__ == "__main__":
                                    run_name, frame_stack=1) for i in range(args.num_envs)]
     elif "minigrid" in args.gym_id.lower():
         envs_lst = [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                      run_name, agent_view_size=3, tile_size=16, max_episode_steps=96) for i in range(args.num_envs)]
+                                      run_name, agent_view_size=3, tile_size=28, max_episode_steps=96) for i in range(args.num_envs)]
     elif "poc" in args.gym_id.lower():
         envs_lst = [make_poc_env(args.gym_id, args.seed + i, i, args.capture_video,
                                  run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96) for i in range(args.num_envs)]
@@ -161,6 +169,20 @@ if __name__ == "__main__":
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
     print(f"Total parameters: {total_params / 10e6:.4f}M, trainable parameters: {trainable_params / 10e6:.4f}M")
+
+    try:
+        from thop import profile
+        dummy_done = torch.zeros(args.num_envs).to(device)
+        dummy_input = torch.randn((args.num_envs,) + envs.single_observation_space.shape).to(device)
+        if args.rnn_type == "lstm":
+            dummy_rnn_state = (torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn.hidden_size).to(device),
+                               torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn.hidden_size).to(device))
+        else:
+            dummy_rnn_state = torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn.hidden_size).to(device)
+        flops, _ = profile(agent, inputs=(dummy_input, dummy_rnn_state, dummy_done))
+        writer.add_scalar("metrics/FLOPs", flops, 0)
+    except ImportError:
+        print("thop not installed, skipping FLOPs logging")
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -187,6 +209,7 @@ if __name__ == "__main__":
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(1, num_updates + 1):
+        update_start_time = time.time()
         if args.rnn_type == "lstm":
             initial_rnn_state = (next_rnn_state[0].clone(), next_rnn_state[1].clone())
         else:
@@ -197,17 +220,20 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        inference_time_total = 0.0
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
 
             # Action logic
+            inf_start = time.time()
             with torch.no_grad():
                 action, logprob, _, value, next_rnn_state = agent.get_action_and_value(
                     next_obs, next_rnn_state, next_done
                 )
-                values[step] = value.flatten()
+            inference_time_total += (time.time() - inf_start)
+            values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
@@ -218,17 +244,24 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            if 'final_info' in info:
-                final_info_array = np.array(info['final_info'])
-                valid_indices = np.where(final_info_array != None)[0]
-                valid_final_infos = final_info_array[valid_indices]
-                episodic_returns = np.array([entry['episode']['r'] for entry in valid_final_infos if 'episode' in entry])
-                episodic_lengths = np.array([entry['episode']['l'] for entry in valid_final_infos if 'episode' in entry])
-                avg_return = float(f'{np.round(np.mean(episodic_returns), 3):.3f}')
-                avg_length = float(f'{np.round(np.mean(episodic_lengths), 3):.3f}')
-                episode_infos.append({'r': avg_return, 'l': avg_length})
-                writer.add_scalar("charts/episode_return", avg_return, global_step)
-                writer.add_scalar("charts/episode_length", avg_length, global_step)
+            #print(info)
+
+            final_info = info.get('final_info')
+            if final_info is not None and len(final_info) > 0:
+                #print(f"final_info={final_info}")
+                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
+                if valid_entries:
+                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
+                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
+                    avg_return = float(f'{np.mean(episodic_returns):.3f}')
+                    avg_length = float(f'{np.mean(episodic_lengths):.3f}')
+                    episode_infos.append({'r': avg_return, 'l': avg_length})
+                    #print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                    writer.add_scalar("charts/episode_return", avg_return, global_step)
+                    writer.add_scalar("charts/episode_length", avg_length, global_step)
+
+        avg_inference_latency = inference_time_total / args.num_steps
+        writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -353,7 +386,8 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         sps = int(global_step / (time.time() - start_time))
-        print(f"Update {update}: SPS={sps}, Return={np.mean([ep['r'] for ep in episode_infos]) if episode_infos else 0:.2f}, "
+        current_return = np.mean([ep['r'] for ep in episode_infos]) if episode_infos else 0.0
+        print(f"Update {update}: SPS={sps}, Return={current_return:.2f}, "
               f"pi_loss={pg_loss.item():.6f}, v_loss={v_loss.item():.6f}, entropy={entropy_loss.item():.6f}, "
               f"explained_var={explained_var:.6f}")
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
@@ -367,4 +401,28 @@ if __name__ == "__main__":
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         writer.add_scalar("charts/SPS", sps, global_step)
+
+        # Log average episode return
+        if episode_infos:
+            avg_episode_return = np.mean([ep['r'] for ep in episode_infos])
+            writer.add_scalar("charts/avg_episode_return", avg_episode_return, global_step)
+
+        # Log training update duration (wall-clock time per update)
+        update_time = time.time() - update_start_time
+        writer.add_scalar("metrics/training_time_per_update", update_time, global_step)
+        
+        # Log GPU memory usage (in MB)
+        gpu_memory = torch.cuda.memory_allocated(device) / 1e6
+        writer.add_scalar("metrics/GPU_memory_usage", gpu_memory, global_step)
+        
+        # Save model checkpoint every save_interval updates
+        if args.save_model and update % args.save_interval == 0:
+            model_path = f"runs/{run_name}/{args.exp_name}_update_{update}.cleanrl_model"
+            model_data = {
+                "model_weights": agent.state_dict(),
+                "args": vars(args),
+            }
+            torch.save(model_data, model_path)
+            print(f"Model saved to {model_path}")
+        
     finish_logging(args, writer, run_name, envs)

@@ -109,9 +109,8 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        d_model = 128                         # embedding dimension for Mamba
-        d_state = 16                          # how large the Mamba internal dimension is
-        # E.g. for (28,28,3) shapes
+        d_model = 128
+        d_state = 16
         self.network = nn.Sequential(
             layer_init(nn.Conv2d(3, 32, 8, stride=4)),
             nn.ReLU(),
@@ -123,24 +122,16 @@ class Agent(nn.Module):
             layer_init(nn.Linear(256, d_model)),
             nn.ReLU(),
         )
-
-        # 2) Mamba: the sequence block
-        #    The model dimension is d_model, plus an internal 'state' dimension
-        #    for SSM memory.
         self.mamba = Mamba(
             d_model=d_model,
             d_state=d_state,
-            d_conv=4,    # local convolution width
-            expand=2,    # expansion factor
+            d_conv=4,
+            expand=2,
         )
-
-        # 3) Post-Mamba MLP
         self.post_mamba = nn.Sequential(
             layer_init(nn.Linear(d_model, d_model)),
             nn.ReLU(),
         )
-
-        # 4) Actor & Critic
         self.actor = layer_init(nn.Linear(d_model, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(d_model, 1), std=1.0)
 
@@ -148,8 +139,8 @@ class Agent(nn.Module):
         # x has shape (batch_size, seq_len, height, width, channels)
         x = x.permute(0, 1, 4, 2, 3)
         batch_size, seq_len = x.shape[0], x.shape[1]
-        x = x.contiguous().view(batch_size * seq_len, *x.shape[2:])  # Flatten sequence dimension
-        hidden = self.network(x / 255.0)  # Normalize pixel values
+        x = x.contiguous().view(batch_size * seq_len, *x.shape[2:])
+        hidden = self.network(x / 255.0)
         #hidden = self.input_proj(hidden)
         hidden = hidden.view(batch_size, seq_len, -1)
         output = self.mamba(hidden)
