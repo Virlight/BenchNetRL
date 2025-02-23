@@ -28,7 +28,6 @@ def parse_args():
     parser.add_argument("--rnn-hidden-dim", type=int, default=512,
         help="the hidden dimension of the rnn")
     args = parser.parse_args()
-    args.exp_name = os.path.basename(__file__).rstrip(".py")
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
