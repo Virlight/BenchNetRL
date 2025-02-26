@@ -130,8 +130,11 @@ if __name__ == "__main__":
     # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    torch.backends.cudnn.benchmark = False
 
     if args.cuda and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available on this system.")
@@ -168,20 +171,6 @@ if __name__ == "__main__":
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
     print(f"Total parameters: {total_params / 10e6:.4f}M, trainable parameters: {trainable_params / 10e6:.4f}M")
-
-    try:
-        from thop import profile
-        dummy_done = torch.zeros(args.num_envs).to(device)
-        dummy_input = torch.randn((args.num_envs,) + envs.single_observation_space.shape).to(device)
-        if args.rnn_type == "lstm":
-            dummy_rnn_state = (torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn.hidden_size).to(device),
-                               torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn.hidden_size).to(device))
-        else:
-            dummy_rnn_state = torch.zeros(agent.rnn.num_layers, args.num_envs, agent.rnn.hidden_size).to(device)
-        flops, _ = profile(agent, inputs=(dummy_input, dummy_rnn_state, dummy_done))
-        writer.add_scalar("metrics/FLOPs", flops, 0)
-    except ImportError:
-        print("thop not installed, skipping FLOPs logging")
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
