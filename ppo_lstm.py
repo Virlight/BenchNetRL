@@ -399,9 +399,20 @@ if __name__ == "__main__":
         update_time = time.time() - update_start_time
         writer.add_scalar("metrics/training_time_per_update", update_time, global_step)
         
-        # Log GPU memory usage (in MB)
-        gpu_memory = torch.cuda.memory_allocated(device) / 1e6
-        writer.add_scalar("metrics/GPU_memory_usage", gpu_memory, global_step)
+        # Log GPU memory usage
+        gpu_memory_allocated = torch.cuda.memory_allocated(device)  
+        gpu_memory_reserved = torch.cuda.memory_reserved(device)
+        total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
+
+        gpu_memory_allocated_gb = gpu_memory_allocated / (1024**3)
+        gpu_memory_reserved_gb = gpu_memory_reserved / (1024**3)
+        gpu_memory_allocated_percent = (gpu_memory_allocated / total_gpu_memory) * 100
+        gpu_memory_reserved_percent = (gpu_memory_reserved / total_gpu_memory) * 100
+
+        writer.add_scalar("metrics/GPU_memory_allocated_GB", gpu_memory_allocated_gb, global_step)
+        writer.add_scalar("metrics/GPU_memory_reserved_GB", gpu_memory_reserved_gb, global_step)
+        writer.add_scalar("metrics/GPU_memory_allocated_percent", gpu_memory_allocated_percent, global_step)
+        writer.add_scalar("metrics/GPU_memory_reserved_percent", gpu_memory_reserved_percent, global_step)
         
         # Save model checkpoint every save_interval updates
         if args.save_model and update % args.save_interval == 0:
