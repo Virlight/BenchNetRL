@@ -38,7 +38,6 @@ class Agent(nn.Module):
         self.obs_space = envs.single_observation_space
         self.rnn_type = args.rnn_type
         self.args = args
-        #print(f"Observation space: {self.obs_space.shape}")
         if len(self.obs_space.shape) == 3:  # image observation
             if self.obs_space.shape[0] in [1, 3]:
                 in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
@@ -232,11 +231,9 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            #print(info)
 
             final_info = info.get('final_info')
             if final_info is not None and len(final_info) > 0:
-                #print(f"final_info={final_info}")
                 valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
                 if valid_entries:
                     episodic_returns = [entry['episode']['r'] for entry in valid_entries]
@@ -244,7 +241,6 @@ if __name__ == "__main__":
                     avg_return = float(f'{np.mean(episodic_returns):.3f}')
                     avg_length = float(f'{np.mean(episodic_lengths):.3f}')
                     episode_infos.append({'r': avg_return, 'l': avg_length})
-                    #print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
                     writer.add_scalar("charts/episode_return", avg_return, global_step)
                     writer.add_scalar("charts/episode_length", avg_length, global_step)
 
@@ -277,9 +273,9 @@ if __name__ == "__main__":
         envsperbatch = args.num_envs // args.num_minibatches
         envinds = np.arange(args.num_envs)
         flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
-        clipfracs = []
 
         # Initialize accumulators for metrics
+        clipfracs = []
         total_loss_list = []
         pg_loss_list = []
         v_loss_list = []
