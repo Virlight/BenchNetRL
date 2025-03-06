@@ -21,6 +21,8 @@ from layers import layer_init
 def parse_args():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
+    parser.add_argument("--hidden-dim", type=int, default=512,
+        help="the hidden dimension of the model")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -66,9 +68,9 @@ class Agent(nn.Module):
         )
     
     def get_states(self, x):
-        if "minigrid" in self.args.gym_id.lower():
-            x = x.permute((0, 3, 1, 2)) / 255.0
-        if "ale" in self.args.gym_id.lower():
+        if "minigrid" in self.args.gym_id.lower() or "mortar" in self.args.gym_id.lower():
+            x = x.permute(0, 3, 1, 2) / 255.0
+        if "ale/" in self.args.gym_id.lower():
             x = x / 255.0
         hidden = self.encoder(x)
         return hidden
@@ -92,8 +94,11 @@ if __name__ == "__main__":
     # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    torch.backends.cudnn.benchmark = False
 
     if args.cuda and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available on this system.")
