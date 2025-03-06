@@ -174,7 +174,7 @@ if __name__ == "__main__":
     elif args.gym_id == "MortarMayhem-Grid-v0":
         envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name) for i in range(args.num_envs)]
-    elif args.gym_id in ["HalfCheetah-v4, Hopper-v4, Walker2d-v4"]:
+    elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
         envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name) for i in range(args.num_envs)]
     else:

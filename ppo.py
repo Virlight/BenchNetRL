@@ -11,11 +11,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from collections import deque
 
 from gae import compute_advantages
 from exp_utils import add_common_args, setup_logging, finish_logging
-from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env
+from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from layers import layer_init
 
 def parse_args():
@@ -117,6 +118,9 @@ if __name__ == "__main__":
                                  run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96) for i in range(args.num_envs)]
     elif args.gym_id == "MortarMayhem-Grid-v0":
         envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                        run_name) for i in range(args.num_envs)]
+    elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
+        envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 

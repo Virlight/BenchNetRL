@@ -196,7 +196,7 @@ if __name__ == "__main__":
 
     # Env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
