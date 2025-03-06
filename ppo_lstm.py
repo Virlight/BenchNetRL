@@ -11,11 +11,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from collections import deque
 
 from gae import compute_advantages
 from exp_utils import add_common_args, setup_logging, finish_logging
-from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env
+from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from layers import layer_init
 
 def parse_args():
@@ -73,8 +74,15 @@ class Agent(nn.Module):
                 nn.init.orthogonal_(param, 1.0)
 
         self.ln = nn.LayerNorm(self.args.rnn_hidden_dim)
-        self.actor = layer_init(nn.Linear(self.args.rnn_hidden_dim, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(self.args.rnn_hidden_dim, 1), std=1.0)
+        if isinstance(envs.single_action_space, gym.spaces.Discrete):
+            self.is_continuous = False
+            self.actor = layer_init(nn.Linear(args.rnn_hidden_dim, envs.single_action_space.n), std=0.01)
+        elif isinstance(envs.single_action_space, gym.spaces.Box):
+            self.is_continuous = True
+            action_dim = np.prod(envs.single_action_space.shape)
+            self.actor_mean = layer_init(nn.Linear(args.rnn_hidden_dim, action_dim), std=0.01)
+            self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
 
     def get_states(self, x, rnn_state, done):
         if "minigrid" in self.args.gym_id.lower() or "mortar" in self.args.gym_id.lower():
@@ -116,11 +124,24 @@ class Agent(nn.Module):
 
     def get_action_and_value(self, x, rnn_state, done, action=None):
         hidden, rnn_state = self.get_states(x, rnn_state, done)
-        logits = self.actor(hidden)
-        probs = Categorical(logits=logits)
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), rnn_state
+        if self.is_continuous:
+            action_mean = self.actor_mean(hidden)
+            action_logstd = self.actor_logstd.expand_as(action_mean)
+            action_std = torch.exp(action_logstd)
+            dist = Normal(action_mean, action_std)
+            if action is None:
+                action = dist.sample()
+            logprob = dist.log_prob(action).sum(-1)
+            entropy = dist.entropy().sum(-1)
+        else:
+            logits = self.actor(hidden)
+            dist = Categorical(logits=logits)
+            if action is None:
+                action = dist.sample()
+            logprob = dist.log_prob(action)
+            entropy = dist.entropy()
+        value = self.critic(hidden)
+        return action, logprob, entropy, value, rnn_state
 
 if __name__ == "__main__":
     args = parse_args()
@@ -152,6 +173,9 @@ if __name__ == "__main__":
                                  run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96) for i in range(args.num_envs)]
     elif args.gym_id == "MortarMayhem-Grid-v0":
         envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                        run_name) for i in range(args.num_envs)]
+    elif args.gym_id in ["HalfCheetah-v4, Hopper-v4, Walker2d-v4"]:
+        envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
