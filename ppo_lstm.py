@@ -39,29 +39,40 @@ class Agent(nn.Module):
         self.obs_space = envs.single_observation_space
         self.rnn_type = args.rnn_type
         self.args = args
-        if len(self.obs_space.shape) == 3:  # image observation
-            if self.obs_space.shape[0] in [1, 3]:
-                in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
-            else:
-                in_channels = self.obs_space.shape[2]
-            self.encoder = nn.Sequential(
-                layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-                nn.ReLU(),
-                nn.Flatten(),
-                layer_init(nn.Linear(64 * 7 * 7, self.args.hidden_dim)),
-                nn.ReLU(),
-            )
-        else:  # vector observation
+        mujoco_envs = ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]
+        if args.gym_id in mujoco_envs:
             input_dim = np.prod(self.obs_space.shape)
             self.encoder = nn.Sequential(
                 nn.Flatten(),
-                nn.Linear(input_dim, self.args.hidden_dim),
-                nn.ReLU(),
+                layer_init(nn.Linear(input_dim, 64)),
+                nn.Tanh(),
+                layer_init(nn.Linear(64, self.args.hidden_dim)),
+                nn.Tanh(),
             )
+        else:
+            if len(self.obs_space.shape) == 3:  # image observation
+                if self.obs_space.shape[0] in [1, 3]:
+                    in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
+                else:
+                    in_channels = self.obs_space.shape[2]
+                self.encoder = nn.Sequential(
+                    layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
+                    nn.ReLU(),
+                    layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+                    nn.ReLU(),
+                    layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                    layer_init(nn.Linear(64 * 7 * 7, self.args.hidden_dim)),
+                    nn.ReLU(),
+                )
+            else:  # vector observation
+                input_dim = np.prod(self.obs_space.shape)
+                self.encoder = nn.Sequential(
+                    nn.Flatten(),
+                    nn.Linear(input_dim, self.args.hidden_dim),
+                    nn.ReLU(),
+                )
         
         if self.rnn_type == "lstm":
             self.rnn = nn.LSTM(self.args.hidden_dim, self.args.rnn_hidden_dim)
@@ -170,7 +181,7 @@ if __name__ == "__main__":
                                       run_name, agent_view_size=3, tile_size=28, max_episode_steps=96) for i in range(args.num_envs)]
     elif "poc" in args.gym_id.lower():
         envs_lst = [make_poc_env(args.gym_id, args.seed + i, i, args.capture_video,
-                                 run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96) for i in range(args.num_envs)]
+                                 run_name, step_size=0.02, glob=False, freeze=True, max_episode_steps=96) for i in range(args.num_envs)]
     elif args.gym_id == "MortarMayhem-Grid-v0":
         envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name) for i in range(args.num_envs)]
@@ -181,7 +192,6 @@ if __name__ == "__main__":
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                      run_name) for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(envs_lst)
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -324,7 +334,7 @@ if __name__ == "__main__":
                     b_obs[mb_inds],
                     rnn_slice,
                     b_dones[mb_inds],
-                    b_actions.long()[mb_inds],
+                    b_actions.long()[mb_inds] if not agent.is_continuous else b_actions[mb_inds],
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
