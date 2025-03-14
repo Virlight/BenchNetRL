@@ -34,39 +34,58 @@ class Agent(nn.Module):
         super(Agent, self).__init__()
         self.obs_space = envs.single_observation_space
         self.args = args
-        if len(self.obs_space.shape) == 3:  # image observation
-            if self.obs_space.shape[0] in [1, 3]:
-                in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
-            else:
-                in_channels = self.obs_space.shape[2]
-            self.encoder = nn.Sequential(
-                layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-                nn.ReLU(),
-                nn.Flatten(),
-                layer_init(nn.Linear(64 * 7 * 7, self.args.hidden_dim)),
-                nn.ReLU(),
-            )
-        else:  # vector observation
+        mujoco_envs = ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]
+        if args.gym_id in mujoco_envs:
             input_dim = np.prod(self.obs_space.shape)
             self.encoder = nn.Sequential(
                 nn.Flatten(),
-                nn.Linear(input_dim, self.args.hidden_dim),
-                nn.ReLU(),
+                layer_init(nn.Linear(input_dim, 64)),
+                nn.Tanh(),
+                layer_init(nn.Linear(64, self.args.hidden_dim)),
+                nn.Tanh(),
             )
+        else:
+            if len(self.obs_space.shape) == 3:  # image observation
+                if self.obs_space.shape[0] in [1, 3, 4]:
+                    in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
+                else:
+                    in_channels = self.obs_space.shape[2]
+                self.encoder = nn.Sequential(
+                    layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
+                    nn.ReLU(),
+                    layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+                    nn.ReLU(),
+                    layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                    layer_init(nn.Linear(64 * 7 * 7, self.args.hidden_dim)),
+                    nn.ReLU(),
+                )
+            else:  # vector observation
+                input_dim = np.prod(self.obs_space.shape)
+                self.encoder = nn.Sequential(
+                    nn.Flatten(),
+                    nn.Linear(input_dim, self.args.hidden_dim),
+                    nn.ReLU(),
+                )
         self.critic = nn.Sequential(
             layer_init(nn.Linear(args.hidden_dim, args.hidden_dim // 2)),
             nn.ReLU(),
             layer_init(nn.Linear(args.hidden_dim // 2, 1), std=1.0),
         )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(args.hidden_dim, args.hidden_dim // 2)),
-            nn.ReLU(),
-            layer_init(nn.Linear(args.hidden_dim // 2, envs.single_action_space.n), std=0.01),
-        )
+        
+        if isinstance(envs.single_action_space, gym.spaces.Discrete):
+            self.is_continuous = False
+            self.actor = nn.Sequential(
+                layer_init(nn.Linear(args.hidden_dim, args.hidden_dim // 2)),
+                nn.ReLU(),
+                layer_init(nn.Linear(args.hidden_dim // 2, envs.single_action_space.n), std=0.01),
+            )
+        elif isinstance(envs.single_action_space, gym.spaces.Box):
+            self.is_continuous = True
+            action_dim = np.prod(envs.single_action_space.shape)
+            self.actor_mean = layer_init(nn.Linear(args.hidden_dim, action_dim), std=0.01)
+            self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
     
     def get_states(self, x):
         if "minigrid" in self.args.gym_id.lower() or "mortar" in self.args.gym_id.lower():
@@ -82,11 +101,24 @@ class Agent(nn.Module):
 
     def get_action_and_value(self, x, action=None):
         hidden = self.get_states(x)
-        logits = self.actor(hidden)
-        probs = Categorical(logits=logits)
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+        if self.is_continuous:
+            action_mean = self.actor_mean(hidden)
+            action_logstd = self.actor_logstd.expand_as(action_mean)
+            action_std = torch.exp(action_logstd)
+            dist = Normal(action_mean, action_std)
+            if action is None:
+                action = dist.sample()
+            logprob = dist.log_prob(action).sum(-1)
+            entropy = dist.entropy().sum(-1)
+        else:
+            logits = self.actor(hidden)
+            dist = Categorical(logits=logits)
+            if action is None:
+                action = dist.sample()
+            logprob = dist.log_prob(action)
+            entropy = dist.entropy()
+        value = self.critic(hidden)
+        return action, logprob, entropy, value
 
 if __name__ == "__main__":
     args = parse_args()
@@ -115,7 +147,7 @@ if __name__ == "__main__":
                                       run_name, agent_view_size=3, tile_size=28, max_episode_steps=96) for i in range(args.num_envs)]
     elif "poc" in args.gym_id.lower():
         envs_lst = [make_poc_env(args.gym_id, args.seed + i, i, args.capture_video,
-                                 run_name, step_size=0.2, glob=False, freeze=False, max_episode_steps=96) for i in range(args.num_envs)]
+                                 run_name, step_size=0.02, glob=False, freeze=True, max_episode_steps=96) for i in range(args.num_envs)]
     elif args.gym_id == "MortarMayhem-Grid-v0":
         envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
                                         run_name) for i in range(args.num_envs)]
@@ -126,7 +158,6 @@ if __name__ == "__main__":
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                      run_name) for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(envs_lst)
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -238,7 +269,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds] if not agent.is_continuous else b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 

@@ -54,29 +54,40 @@ class Agent(nn.Module):
         self.obs_space = envs.single_observation_space
         self.max_episode_steps = max_episode_steps
         self.args = args
-        if len(self.obs_space.shape) == 3:  # image observation
-            if self.obs_space.shape[0] in [1, 3]:
-                in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
-            else:
-                in_channels = self.obs_space.shape[2]
-            self.encoder = nn.Sequential(
-                layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-                nn.ReLU(),
-                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-                nn.ReLU(),
-                nn.Flatten(),
-                layer_init(nn.Linear(64 * 7 * 7, self.args.trxl_dim)),
-                nn.ReLU(),
-            )
-        else:  # vector observation
+        mujoco_envs = ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]
+        if args.gym_id in mujoco_envs:
             input_dim = np.prod(self.obs_space.shape)
             self.encoder = nn.Sequential(
                 nn.Flatten(),
-                nn.Linear(input_dim, self.args.trxl_dim),
-                nn.ReLU(),
+                layer_init(nn.Linear(input_dim, 64)),
+                nn.Tanh(),
+                layer_init(nn.Linear(64, self.args.trxl_dim)),
+                nn.Tanh(),
             )
+        else:
+            if len(self.obs_space.shape) == 3:  # image observation
+                if self.obs_space.shape[0] in [1, 3, 4]:
+                    in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
+                else:
+                    in_channels = self.obs_space.shape[2]
+                self.encoder = nn.Sequential(
+                    layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
+                    nn.ReLU(),
+                    layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+                    nn.ReLU(),
+                    layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                    layer_init(nn.Linear(64 * 7 * 7, self.args.trxl_dim)),
+                    nn.ReLU(),
+                )
+            else:  # vector observation
+                input_dim = np.prod(self.obs_space.shape)
+                self.encoder = nn.Sequential(
+                    nn.Flatten(),
+                    nn.Linear(input_dim, self.args.trxl_dim),
+                    nn.ReLU(),
+                )
 
         # Transformer model
         self.transformer = Transformer(
@@ -89,12 +100,19 @@ class Agent(nn.Module):
             nn.ReLU(),
         )
 
-        self.actor_branches = nn.ModuleList(
-            [
-                layer_init(nn.Linear(args.trxl_dim, out_features=num_actions), std=0.01)
-                for num_actions in action_space_shape
-            ]
-        )
+        if isinstance(envs.single_action_space, gym.spaces.Box):
+            self.is_continuous = True
+            action_dim = np.prod(envs.single_action_space.shape)
+            self.actor_mean = layer_init(nn.Linear(args.trxl_dim, action_dim), std=0.01)
+            self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
+        else:
+            self.is_continuous = False
+            self.actor_branches = nn.ModuleList(
+                [
+                    layer_init(nn.Linear(args.trxl_dim, out_features=num_actions), std=0.01)
+                    for num_actions in action_space_shape
+                ]
+            )
         self.critic = layer_init(nn.Linear(args.trxl_dim, 1), std=1.0)
 
     def get_states(self, x):
@@ -116,12 +134,23 @@ class Agent(nn.Module):
         x, memory = self.transformer(x, memory, memory_mask, memory_indices)
         x = self.hidden_post_trxl(x)
         
-        probs = [Categorical(logits=branch(x)) for branch in self.actor_branches]
-        if action is None:
-            action = torch.stack([dist.sample() for dist in probs], dim=1)
-        logprobs = [dist.log_prob(action[:, i]) for i, dist in enumerate(probs)]
-        entropies = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(-1)
-        return action, torch.stack(logprobs, dim=1), entropies, self.critic(x).flatten(), memory
+        if self.is_continuous:
+            action_mean = self.actor_mean(x)
+            action_logstd = self.actor_logstd.expand_as(action_mean)
+            action_std = torch.exp(action_logstd)
+            dist = Normal(action_mean, action_std)
+            if action is None:
+                action = dist.sample()
+            logprob = dist.log_prob(action).sum(-1)
+            entropy = dist.entropy().sum(-1)
+        else:
+            probs = [Categorical(logits=branch(x)) for branch in self.actor_branches]
+            if action is None:
+                action = torch.stack([dist.sample() for dist in probs], dim=1)
+            logprobs = [dist.log_prob(action[:, i]) for i, dist in enumerate(probs)]
+            entropy = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(-1)
+            logprob = torch.stack(logprobs, dim=1)
+        return action, logprob, entropy, self.critic(x).flatten(), memory
 
 if __name__ == "__main__":
     args = parse_args()
@@ -161,7 +190,6 @@ if __name__ == "__main__":
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                      run_name) for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(envs_lst)
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     env_current_episode_step = torch.zeros((args.num_envs,), dtype=torch.long)
     max_episode_steps = getattr(envs.envs[0], "max_episode_steps", 1024)
@@ -191,7 +219,11 @@ if __name__ == "__main__":
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long).to(device)
+    if agent.is_continuous:
+        action_dim = np.prod(envs.single_action_space.shape)
+        actions = torch.zeros((args.num_steps, args.num_envs, action_dim)).to(device)
+    else:
+        actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long).to(device)    
     logprobs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape))).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -257,7 +289,10 @@ if __name__ == "__main__":
             inference_time_total += (time.time() - inf_start)
 
             # Execute the game and log data
-            next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy().squeeze(1))
+            if agent.is_continuous:
+                next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+            else:
+                next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy().squeeze(1))
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs = torch.Tensor(next_obs).to(device)
@@ -348,7 +383,7 @@ if __name__ == "__main__":
                 mb_memory_windows = batched_index_select(mb_memories, 1, b_memory_indices[mb_inds])
 
                 _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
-                    b_obs[mb_inds], mb_memory_windows, b_memory_mask[mb_inds], b_memory_indices[mb_inds], b_actions[mb_inds]
+                    b_obs[mb_inds], mb_memory_windows, b_memory_mask[mb_inds], b_memory_indices[mb_inds], b_actions.long()[mb_inds] if not agent.is_continuous else b_actions[mb_inds]
                 )
 
                 # Advantage processing

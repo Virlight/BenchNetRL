@@ -51,7 +51,7 @@ class Agent(nn.Module):
             )
         else:
             if len(self.obs_space.shape) == 3:  # image observation
-                if self.obs_space.shape[0] in [1, 3]:
+                if self.obs_space.shape[0] in [1, 3, 4]:
                     in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
                 else:
                     in_channels = self.obs_space.shape[2]
