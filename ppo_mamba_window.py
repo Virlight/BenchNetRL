@@ -3,6 +3,7 @@ import os
 import random
 import time
 from distutils.util import strtobool
+from collections import deque
 
 import gymnasium as gym
 import wandb
@@ -15,7 +16,7 @@ from torch.distributions.categorical import Categorical
 from mamba_ssm import Mamba
 
 from gae import compute_advantages
-from env_utils import make_minigrid_env, make_atari_env, make_poc_env
+from env_utils import make_minigrid_env, make_atari_env, make_poc_env, make_classic_env, make_memory_gym_env
 from exp_utils import setup_logging, finish_logging, add_common_args
 
 # Add a new argument for episodic memory length
@@ -43,48 +44,41 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
         torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-# --- New Agent using Mamba-based episodic memory ---
-#
-# The design is as follows:
-# 1. Use a CNN encoder (as before) to get an embedding of the observation.
-# 2. Maintain a memory window (of fixed length) per environment.
-# 3. Concatenate the detached memory window with the current token and feed into a Mamba block.
-# 4. Use the last token output from Mamba as the current representation for the policy and value.
-# 5. Update the memory window by shifting (and appending the new token after detaching).
-#
-# During rollout the per-env memory is stored in a buffer and reset on episode termination.
-# In training, the stored memory windows (already detached) are passed along with observations.
-
+# --- Agent using Mamba-based episodic memory ---
 class Agent(nn.Module):
     def __init__(self, envs, args):
         super(Agent, self).__init__()
+        self.obs_space = envs.single_observation_space
+        self.args = args
         self.hidden_dim = args.hidden_dim
         self.memory_length = args.memory_length  # episodic memory window length
 
-        # CNN encoder: same as before.
-        self.encoder = nn.Sequential(
-            layer_init(nn.Conv2d(3, 32, 8, stride=4)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-            nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(64 * 2 * 2, args.hidden_dim)),
-            nn.ReLU(),
-        )
-
-        self.encoder = nn.Sequential(
-            nn.Linear(3, args.hidden_dim),
-            nn.ReLU(),
-            # nn.Linear(8, args.hidden_dim),
-            # nn.ReLU(),
-        )
+        # Determine the observation space type and create appropriate encoder
+        if len(self.obs_space.shape) == 3:  # image observation
+            if self.obs_space.shape[0] in [1, 3]:
+                in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
+            else:
+                in_channels = self.obs_space.shape[2]
+            self.encoder = nn.Sequential(
+                layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+                nn.ReLU(),
+                nn.Flatten(),
+                layer_init(nn.Linear(64 * 7 * 7, self.args.hidden_dim)),
+                nn.ReLU(),
+            )
+        else:  # vector observation
+            input_dim = np.prod(self.obs_space.shape)
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(input_dim, self.args.hidden_dim),
+                nn.ReLU(),
+            )
 
         # Mamba block: it processes a sequence of tokens.
-        # Here, each token has dimension hidden_dim.
-        # We pass a sequence of length (memory_length + 1) where the first memory_length tokens
-        # come from past steps (detached) and the last token is the current observation.
         self.mamba = Mamba(
             d_model=args.hidden_dim,
             d_state=args.d_state,
@@ -96,23 +90,27 @@ class Agent(nn.Module):
         self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1)
 
+    def get_states(self, x):
+        """Process observations to get encoded states."""
+        if "minigrid" in self.args.gym_id.lower() or "mortar" in self.args.gym_id.lower():
+            x = x.permute(0, 3, 1, 2) / 255.0
+        if "ale/" in self.args.gym_id.lower():
+            x = x / 255.0
+        hidden = self.encoder(x)
+        return hidden
+
     def forward_with_memory(self, x, memory_window):
         """
         x: current observation (B, obs_dim)
         memory_window: (B, memory_length, hidden_dim)
-        step: current time step (an integer or tensor scalar); if provided, used to decide whether to detach
-        truncation_interval: allow gradient flow for this many steps before truncating
         """
         B = x.shape[0]
-        x_enc = self.encoder(x) 
-        #x_enc = self.encoder(x.permute((0, 3, 1, 2)) / 255.0)  # (B, hidden_dim)
+        x_enc = self.get_states(x)
         x_token = x_enc.unsqueeze(1)  # (B, 1, hidden_dim)
 
         # If no memory is provided, initialize it to zeros.
         if memory_window is None:
             memory_window = torch.zeros(B, self.memory_length, self.hidden_dim, device=x.device)
-        # Here, we do not detach the entire memory_window—so that past tokens can keep their gradients
-        # (or you could decide to detach only if they are older than a threshold).
 
         # Concatenate memory window with current token.
         seq = torch.cat([memory_window, x_token], dim=1)  # (B, memory_length+1, hidden_dim)
@@ -149,24 +147,49 @@ if __name__ == "__main__":
     # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    torch.backends.cudnn.benchmark = False
 
     if args.cuda and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available on this system.")
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     torch.set_default_device(device)
 
-    # Environment setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, run_name)
-         for i in range(args.num_envs)]
-    )
+    # Environment setup - enhanced with support for multiple env types
+    if "ale" in args.gym_id.lower():
+        envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
+                                  run_name, frame_stack=1) for i in range(args.num_envs)]
+    elif "minigrid" in args.gym_id.lower():
+        envs_lst = [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, 
+                                     run_name, agent_view_size=3, tile_size=28, max_episode_steps=96) for i in range(args.num_envs)]
+    elif "poc" in args.gym_id.lower():
+        envs_lst = [make_poc_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                run_name, step_size=0.02, glob=False, freeze=True, max_episode_steps=96) for i in range(args.num_envs)]
+    elif args.gym_id == "MortarMayhem-Grid-v0":
+        envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                       run_name) for i in range(args.num_envs)]
+    else:
+        envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
+                                    run_name) for i in range(args.num_envs)]
+    
+    envs = gym.vector.SyncVectorEnv(envs_lst)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-    bce_loss = nn.BCELoss()
+
+    # Log parameter counts
+    total_params = sum(p.numel() for p in agent.parameters())
+    trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
+    if args.track:
+        wandb.config.update({
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params
+        }, allow_val_change=True)
+    print(f"Total parameters: {total_params / 1e6:.4f}M, trainable parameters: {trainable_params / 1e6:.4f}M")
 
     # --- Storage setup ---
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -181,37 +204,42 @@ if __name__ == "__main__":
     # --- Start the game ---
     global_step = 0
     start_time = time.time()
+    episode_infos = deque(maxlen=100)
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-    # Initialize per-env episodic memory (for the Mamba memory window)
+    # Initialize per-env episodic memory
     next_memory = torch.zeros((args.num_envs, agent.memory_length, args.hidden_dim), device=device)
     num_updates = args.total_timesteps // args.batch_size
-    from collections import deque
-    episode_infos = deque(maxlen=100)
 
     for update in range(1, num_updates + 1):
-        # Anneal learning rate if needed.
+        update_start_time = time.time()
+        
+        # Annealing the learning rate
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        inference_time_total = 0.0
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
             # Save the current memory window for this step.
-            stored_memories[step] = next_memory#.detach()
+            stored_memories[step] = next_memory
 
-            # Action logic with memory:
+            # Action logic with timing
+            inf_start = time.time()
             with torch.no_grad():
                 action, logprob, entropy, value, new_memory = agent.get_action_and_value(next_obs, next_memory)
                 values[step] = value.flatten()
+            inference_time_total += (time.time() - inf_start)
             actions[step] = action
             logprobs[step] = logprob
+            next_memory = new_memory  # Update memory for next step
 
-            # Execute the game step.
+            # Execute the game and log data
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
@@ -222,11 +250,8 @@ if __name__ == "__main__":
             for i, d in enumerate(next_done):
                 if d.item():
                     next_memory[i] = torch.zeros(agent.memory_length, args.hidden_dim, device=device)
-                    # if "final_info" in info and info["final_info"][i] is not None and "episode" in info["final_info"][i]:
-                    #     episode_infos.append(info["final_info"][i]["episode"])
-                    if "final_info" in info and info["final_info"][i] is not None:
-                        episode_infos.append(info["final_info"][i])
-            
+
+            # Process episode information
             final_info = info.get('final_info')
             if final_info is not None and len(final_info) > 0:
                 valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
@@ -235,11 +260,15 @@ if __name__ == "__main__":
                     episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
                     avg_return = float(f'{np.mean(episodic_returns):.3f}')
                     avg_length = float(f'{np.mean(episodic_lengths):.3f}')
-                    #print(f"global_step={global_step}, avg_return={avg_return}, avg_length={avg_length}")
+                    episode_infos.append({'r': avg_return, 'l': avg_length})
                     writer.add_scalar("charts/episode_return", avg_return, global_step)
                     writer.add_scalar("charts/episode_length", avg_length, global_step)
 
-        # --- Bootstrap value with memory ---
+        # Log inference performance
+        avg_inference_latency = inference_time_total / args.num_steps
+        writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
+
+        # bootstrap value if not done
         with torch.no_grad():
             next_value, next_memory = agent.get_value(next_obs, next_memory)
             next_value = next_value.reshape(1, -1)
@@ -248,7 +277,7 @@ if __name__ == "__main__":
                 args.gamma, args.gae_lambda, args.gae, args.num_steps, device
             )
 
-        # Flatten the rollout batch.
+        # Flatten the batch.
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -300,7 +329,7 @@ if __name__ == "__main__":
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                     v_clipped = b_values[mb_inds] + torch.clamp(newvalue - b_values[mb_inds],
-                                                                -args.clip_coef, args.clip_coef)
+                                                               -args.clip_coef, args.clip_coef)
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
@@ -312,21 +341,33 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
+                
+                # Calculate gradient norms for logging
+                total_grad_norm = 0.0
+                for p in agent.parameters():
+                    if p.grad is not None:
+                        total_grad_norm += p.grad.data.norm(2).item() ** 2
+                total_grad_norm = total_grad_norm ** 0.5
+                grad_norm_list.append(total_grad_norm)
+                
+                # Clip gradients
                 grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
+                # Append metrics for this minibatch
                 total_loss_list.append(loss.item())
                 pg_loss_list.append(pg_loss.item())
                 v_loss_list.append(v_loss.item())
                 entropy_list.append(entropy_loss.item())
-                grad_norm_list.append(grad_norm.item())
                 approx_kl_list.append(approx_kl.item())
                 old_approx_kl_list.append(old_approx_kl.item())
 
+            # Early stopping based on KL divergence
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
 
+        # Compute metrics means
         avg_total_loss = np.mean(total_loss_list)
         avg_pg_loss = np.mean(pg_loss_list)
         avg_v_loss = np.mean(v_loss_list)
@@ -335,17 +376,20 @@ if __name__ == "__main__":
         avg_approx_kl = np.mean(approx_kl_list)
         avg_old_approx_kl = np.mean(old_approx_kl_list)
 
+        # Calculate explained variance
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
+        # Log performance metrics
         sps = int(global_step / (time.time() - start_time))
-        print(f"Update {update}: SPS={sps}, Return={np.mean([ep['r'] for ep in episode_infos]) if episode_infos else 0:.2f}, "
-              f"pi_loss={pg_loss.item():.6f}, v_loss={v_loss.item():.6f}, entropy={entropy_loss.item():.6f}, "
-              f"explained_var={explained_var:.6f}")
+        current_return = np.mean([ep['r'] for ep in episode_infos]) if episode_infos else 0.0
         
-        writer.add_scalar("charts/SPS", sps, global_step)
-
+        print(f"Update {update}: SPS={sps}, Return={current_return:.2f}, "
+              f"pi_loss={avg_pg_loss:.6f}, v_loss={avg_v_loss:.6f}, entropy={avg_entropy:.6f}, "
+              f"explained_var={explained_var:.6f}")
+              
+        # Log to the writer
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/total_loss", avg_total_loss, global_step)
         writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
@@ -356,4 +400,42 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", avg_approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        writer.add_scalar("charts/SPS", sps, global_step)
+
+        # Log average episode return
+        if episode_infos:
+            avg_episode_return = np.mean([ep['r'] for ep in episode_infos])
+            writer.add_scalar("charts/avg_episode_return", avg_episode_return, global_step)
+
+        # Log training update duration
+        update_time = time.time() - update_start_time
+        writer.add_scalar("metrics/training_time_per_update", update_time, global_step)
+        
+        # Log GPU memory usage
+        if torch.cuda.is_available():
+            gpu_memory_allocated = torch.cuda.memory_allocated(device)  
+            gpu_memory_reserved = torch.cuda.memory_reserved(device)
+            total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
+
+            gpu_memory_allocated_gb = gpu_memory_allocated / (1024**3)
+            gpu_memory_reserved_gb = gpu_memory_reserved / (1024**3)
+            gpu_memory_allocated_percent = (gpu_memory_allocated / total_gpu_memory) * 100
+            gpu_memory_reserved_percent = (gpu_memory_reserved / total_gpu_memory) * 100
+
+            writer.add_scalar("metrics/GPU_memory_allocated_GB", gpu_memory_allocated_gb, global_step)
+            writer.add_scalar("metrics/GPU_memory_reserved_GB", gpu_memory_reserved_gb, global_step)
+            writer.add_scalar("metrics/GPU_memory_allocated_percent", gpu_memory_allocated_percent, global_step)
+            writer.add_scalar("metrics/GPU_memory_reserved_percent", gpu_memory_reserved_percent, global_step)
+        
+        # Save model checkpoint
+        if args.save_model and update % args.save_interval == 0:
+            model_path = f"runs/{run_name}/{args.exp_name}_update_{update}.cleanrl_model"
+            model_data = {
+                "model_weights": agent.state_dict(),
+                "args": vars(args),
+            }
+            torch.save(model_data, model_path)
+            print(f"Model saved to {model_path}")
+        
+    # Cleanup
     finish_logging(args, writer, run_name, envs)
