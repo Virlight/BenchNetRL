@@ -13,11 +13,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 
 from mamba_ssm import Mamba
 
 from gae import compute_advantages
-from env_utils import make_minigrid_env, make_atari_env, make_poc_env, make_classic_env, make_memory_gym_env
+from env_utils import make_minigrid_env, make_atari_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from exp_utils import add_common_args, setup_logging, finish_logging
 from layers import layer_init
 
@@ -52,10 +53,19 @@ class Agent(nn.Module):
         self.obs_space = envs.single_observation_space
         self.args = args
         self.hidden_dim = args.hidden_dim
-
-        # Determine the observation space type and create appropriate encoder
-        if len(self.obs_space.shape) == 3:  # image observation
-            if self.obs_space.shape[0] in [1, 3]:
+        self.is_continuous = isinstance(envs.single_action_space, gym.spaces.Box)
+        mujoco_envs = ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]
+        if args.gym_id in mujoco_envs:
+            input_dim = np.prod(self.obs_space.shape)
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                layer_init(nn.Linear(input_dim, 64)),
+                nn.Tanh(),
+                layer_init(nn.Linear(64, self.args.hidden_dim)),
+                nn.Tanh(),
+            )
+        elif len(self.obs_space.shape) == 3:  # image observation
+            if self.obs_space.shape[0] in [1, 3, 4]:
                 in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
             else:
                 in_channels = self.obs_space.shape[2]
@@ -97,8 +107,13 @@ class Agent(nn.Module):
         )
         
         # Actor and critic heads
-        self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1.0)
+        if self.is_continuous:
+            action_dim = np.prod(envs.single_action_space.shape)
+            self.actor_mean = layer_init(nn.Linear(args.hidden_dim, action_dim), std=0.01)
+            self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
+        else:
+            self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
     
     def get_states(self, x):
         """Process observations to get encoded states."""
@@ -181,11 +196,24 @@ class Agent(nn.Module):
         out = self.norm(out)
         
         hidden = out.squeeze(1)
-        logits = self.actor(hidden)
-        probs = Categorical(logits=logits)
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), (new_conv_state, new_ssm_state)
+        value = self.critic(hidden)
+        if self.is_continuous:
+            action_mean = self.actor_mean(hidden)
+            action_logstd = self.actor_logstd.expand_as(action_mean)
+            action_std = torch.exp(action_logstd)
+            probs = Normal(action_mean, action_std)
+            if action is None:
+                action = probs.sample()
+            logprob = probs.log_prob(action).sum(-1)
+            entropy = probs.entropy().sum(-1)
+        else:
+            logits = self.actor(hidden)
+            probs = Categorical(logits=logits)
+            if action is None:
+                action = probs.sample()
+            logprob = probs.log_prob(action)
+            entropy = probs.entropy()
+        return action, logprob, entropy, value.flatten(), (new_conv_state, new_ssm_state)
 
 if __name__ == "__main__":
     args = parse_args()
@@ -205,7 +233,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     torch.set_default_device(device)
 
-    # Environment setup - enhanced with support for multiple env types
+    # Environment setup - enhanced with support for multiple env types including Mujoco
     if "ale" in args.gym_id.lower():
         envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                   run_name, frame_stack=1) for i in range(args.num_envs)]
@@ -218,13 +246,14 @@ if __name__ == "__main__":
     elif args.gym_id == "MortarMayhem-Grid-v0":
         envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
                                        run_name) for i in range(args.num_envs)]
+    elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
+        envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
+                                       run_name) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                     run_name) for i in range(args.num_envs)]
     
     envs = gym.vector.SyncVectorEnv(envs_lst)
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-
     agent = Agent(envs, args).to(device)
     
     # Separate learning rates for Mamba vs other parameters
@@ -232,8 +261,9 @@ if __name__ == "__main__":
         {"params": agent.encoder.parameters()},
         {"params": agent.norm.parameters()},
         {"params": agent.post_mamba_mlp.parameters()},
-        {"params": agent.actor.parameters()},
         {"params": agent.critic.parameters()},
+        {"params": agent.actor.parameters() if not agent.is_continuous else 
+                  list(agent.actor_mean.parameters()) + [agent.actor_logstd]},
         {"params": agent.mamba.parameters(), "lr": args.mamba_lr}
     ], lr=args.learning_rate, eps=1e-5)
 
@@ -380,12 +410,21 @@ if __name__ == "__main__":
                 full_seq_output = agent.forward_sequence(mb_obs, init_state)  # shape: [T, minibatch_size, hidden_dim]
                 T, B, hidden_dim = full_seq_output.shape
                 flat_features = full_seq_output.reshape(-1, hidden_dim)  # shape: [T*B, hidden_dim]
+                mb_actions = b_actions[mb_inds]
 
-                # Get logits and values
-                logits = agent.actor(flat_features)  # shape: [T*B, num_actions]
-                probs = Categorical(logits=logits)
-                new_logprobs = probs.log_prob(b_actions[mb_inds])
-                new_entropies = probs.entropy()
+                if agent.is_continuous:
+                    action_mean = agent.actor_mean(flat_features)
+                    action_logstd = agent.actor_logstd.expand_as(action_mean)
+                    action_std = torch.exp(action_logstd)
+                    probs = Normal(action_mean, action_std)
+                    new_logprobs = probs.log_prob(mb_actions).sum(-1)
+                    new_entropies = probs.entropy().sum(-1)
+                else:
+                    logits = agent.actor(flat_features)
+                    probs = Categorical(logits=logits)
+                    new_logprobs = probs.log_prob(mb_actions.long().squeeze(-1))
+                    new_entropies = probs.entropy()
+                
                 new_values = agent.critic(flat_features).reshape(-1)
 
                 # Compute the ratio and approximate KL divergence
