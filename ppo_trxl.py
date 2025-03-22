@@ -202,8 +202,7 @@ if __name__ == "__main__":
 
     # Define action space
     observation_space = envs.single_observation_space
-    action_space_shape = ((envs.single_action_space.n,) if isinstance(envs.single_action_space, gym.spaces.Discrete)
-                          else tuple(envs.single_action_space.nvec))
+    action_space_shape = (envs.single_action_space.n,) if isinstance(envs.single_action_space, gym.spaces.Discrete) else tuple(envs.single_action_space.shape)
 
     agent = Agent(envs, args, action_space_shape, max_episode_steps).to(device)
     optimizer = optim.AdamW(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -222,9 +221,10 @@ if __name__ == "__main__":
     if agent.is_continuous:
         action_dim = np.prod(envs.single_action_space.shape)
         actions = torch.zeros((args.num_steps, args.num_envs, action_dim)).to(device)
+        logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     else:
         actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long).to(device)    
-    logprobs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape))).to(device)
+        logprobs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape))).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -347,8 +347,13 @@ if __name__ == "__main__":
 
         # Flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1, len(action_space_shape))
-        b_actions = actions.reshape(-1, len(action_space_shape))
+        if agent.is_continuous:
+            b_logprobs = logprobs.reshape(-1)
+            action_dim = np.prod(envs.single_action_space.shape)
+            b_actions = actions.reshape(-1, action_dim)
+        else:
+            b_logprobs = logprobs.reshape(-1, len(action_space_shape))
+            b_actions = actions.reshape(-1, len(action_space_shape))
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -386,11 +391,11 @@ if __name__ == "__main__":
                     b_obs[mb_inds], mb_memory_windows, b_memory_mask[mb_inds], b_memory_indices[mb_inds], b_actions.long()[mb_inds] if not agent.is_continuous else b_actions[mb_inds]
                 )
 
-                # Advantage processing
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                mb_advantages = mb_advantages.unsqueeze(1).repeat(1, len(action_space_shape))
+                if not agent.is_continuous:
+                    mb_advantages = mb_advantages.unsqueeze(1).repeat(1, len(action_space_shape))
 
                 # Policy loss calculation
                 logratio = newlogprob - b_logprobs[mb_inds]
