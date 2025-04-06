@@ -3,8 +3,6 @@ import os
 import random
 import time
 from distutils.util import strtobool
-from collections import deque
-from types import SimpleNamespace
 
 import gymnasium as gym
 import wandb
@@ -14,37 +12,33 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
-
-from mamba_ssm import Mamba
+from collections import deque
+from types import SimpleNamespace
 
 from gae import compute_advantages
-from env_utils import make_minigrid_env, make_atari_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from exp_utils import add_common_args, setup_logging, finish_logging
+from env_utils import make_atari_env, make_minigrid_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
 from layers import layer_init
+from mamba_ssm import Mamba
 
 def parse_args():
     parser = argparse.ArgumentParser()
     add_common_args(parser)
-    
-    # Mamba-specific arguments (for our recurrent cell)
     parser.add_argument("--hidden-dim", type=int, default=512,
-        help="hidden dimension for the encoder and Mamba")
-    parser.add_argument("--d-state", type=int, default=64,
+        help="the hidden dimension of the model")
+    parser.add_argument("--d-state", type=int, default=16,
         help="SSM state expansion factor for Mamba")
     parser.add_argument("--d-conv", type=int, default=4,
         help="local convolution width for Mamba")
     parser.add_argument("--expand", type=int, default=2,
         help="expansion factor for the Mamba block")
-    parser.add_argument("--mamba-lr", type=float, default=1.5e-4,
+    parser.add_argument("--mamba-lr", type=float, default=1e-4,
         help="learning rate for Mamba parameters (lower than base LR)")
     parser.add_argument("--dt-init", type=str, default="constant", choices=["constant", "random"],
         help="Initialization method for dt projection weights")
     parser.add_argument("--dt-scale", type=float, default=0.05,
         help="Scaling factor for dt initialization")
-    parser.add_argument("--masked-indices", type=str, default="1,3",
-        help="indices of the observations to mask")
     args = parser.parse_args()
-    args.masked_indices = [int(x) for x in args.masked_indices.split(',')]
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
@@ -54,20 +48,8 @@ class Agent(nn.Module):
         super(Agent, self).__init__()
         self.obs_space = envs.single_observation_space
         self.args = args
-        self.hidden_dim = args.hidden_dim
-        self.is_continuous = isinstance(envs.single_action_space, gym.spaces.Box)
-        mujoco_envs = ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]
-        if args.gym_id in mujoco_envs:
-            input_dim = np.prod(self.obs_space.shape)
-            self.encoder = nn.Sequential(
-                nn.Flatten(),
-                layer_init(nn.Linear(input_dim, 64)),
-                nn.Tanh(),
-                layer_init(nn.Linear(64, self.args.hidden_dim)),
-                nn.Tanh(),
-            )
-        elif len(self.obs_space.shape) == 3:  # image observation
-            if self.obs_space.shape[0] in [1, 3, 4]:
+        if len(self.obs_space.shape) == 3:  # image observation
+            if self.obs_space.shape[0] in [1, 3]:
                 in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
             else:
                 in_channels = self.obs_space.shape[2]
@@ -89,36 +71,79 @@ class Agent(nn.Module):
                 nn.Linear(input_dim, self.args.hidden_dim),
                 nn.ReLU(),
             )
-
-        # Mamba model
         self.mamba = Mamba(
             d_model=args.hidden_dim,
             d_state=args.d_state,
             d_conv=args.d_conv,
             expand=args.expand,
-            # dt_scale=args.dt_scale if hasattr(args, 'dt_scale') else 0.05,
-            # dt_init=args.dt_init if hasattr(args, 'dt_init') else "constant",
         )
         self.mamba.layer_idx = 0
-
         self.norm = nn.LayerNorm(self.args.hidden_dim)
+
         self.post_mamba_mlp = nn.Sequential(
-            nn.Linear(args.hidden_dim, args.hidden_dim // 2),
+            nn.Linear(args.hidden_dim, args.hidden_dim),
             nn.ReLU(),
-            nn.Linear(args.hidden_dim // 2, args.hidden_dim),
-        )
+            nn.Linear(args.hidden_dim, args.hidden_dim),
+        )   
         
-        # Actor and critic heads
+        self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(args.hidden_dim, 1), std=1.0)
-        if self.is_continuous:
-            action_dim = np.prod(envs.single_action_space.shape)
-            self.actor_mean = layer_init(nn.Linear(args.hidden_dim, action_dim), std=0.01)
-            self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
-        else:
-            self.actor = layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01)
-    
+
+    def forward_sequence(self, x, init_mamba_state=None, dones=None):
+        """
+        Processes an entire rollout sequence with proper handling of episode terminations.
+        
+        Args:
+            x: Tensor of shape [T, B, ...] containing rollout observations.
+            init_mamba_state: Tuple (conv_state, ssm_state) to use as the initial state.
+            dones: Boolean tensor of shape [T, B] where True indicates an episode termination.
+        
+        Returns:
+            mamba_out: Tensor of shape [T, B, hidden_dim] with the Mamba outputs.
+        """
+        T, B = x.shape[:2]
+        # Flatten time and batch for the encoder:
+        x_flat = x.reshape(-1, *x.shape[2:])  # [T*B, ...]
+        features = self.get_states(x_flat)      # [T*B, hidden_dim] (assumed without normalization)
+        features = features.reshape(T, B, -1)    # [T, B, hidden_dim]
+        
+        # Transpose to batch-first for stepwise processing:
+        features = features.transpose(0, 1)      # [B, T, hidden_dim]
+        
+        # Initialize the state (if not provided, assume zeros)
+        if init_mamba_state is None:
+            init_mamba_state = self.mamba.allocate_inference_cache(B, max_seqlen=1)
+        
+        current_state = init_mamba_state
+        outputs = []
+        
+        # Process one time step at a time:
+        for t in range(T):
+            # If this is not the first time step, check if the previous time step ended an episode.
+            if t > 0 and dones is not None:
+                # dones[t-1] is a [B] boolean tensor indicating which environments terminated at time t-1.
+                done_mask = dones[t - 1]  # shape: [B]
+                if done_mask.any():
+                    # Reset the state for environments that are done.
+                    conv_state, ssm_state = current_state
+                    done_indices = done_mask.nonzero(as_tuple=True)[0]
+                    conv_state[done_indices].zero_()
+                    ssm_state[done_indices].zero_()
+                    current_state = (conv_state, ssm_state)
+            
+            # Process the current step using the one-step call.
+            # features[:, t:t+1, :] has shape [B, 1, hidden_dim]
+            out, new_conv_state, new_ssm_state = self.mamba.step(features[:, t:t+1, :],
+                                                                    current_state[0],
+                                                                    current_state[1])
+            outputs.append(out)
+            current_state = (new_conv_state, new_ssm_state)
+        
+        # Concatenate outputs along time dimension, then transpose back to [T, B, hidden_dim]
+        mamba_out = torch.cat(outputs, dim=1).transpose(0, 1)
+        return mamba_out
+
     def get_states(self, x):
-        """Process observations to get encoded states."""
         if "minigrid" in self.args.gym_id.lower() or "mortar" in self.args.gym_id.lower():
             x = x.permute(0, 3, 1, 2) / 255.0
         if "ale/" in self.args.gym_id.lower():
@@ -126,96 +151,29 @@ class Agent(nn.Module):
         hidden = self.encoder(x)
         return hidden
 
-    def forward_sequence(self, x, init_mamba_state=None):
-        """
-        Processes an entire rollout sequence in one call, injecting an external initial state.
-
-        Args:
-            x: Tensor of shape [T, B, H, W, C] – a rollout of T time steps for B environments.
-            init_mamba_state: A tuple (conv_state, ssm_state) to use as the initial state.
-                              Each should have shape [B, ...].
-
-        Returns:
-            out: Tensor of shape [T, B, hidden_dim] – the Mamba outputs for the entire sequence.
-        """
-        T, B = x.shape[:2]
-        # Flatten time and batch for the encoder
-        x_flat = x.reshape(-1, *x.shape[2:])  # shape: [T*B, H, W, C]
-        features = self.get_states(x_flat)  # shape: [T*B, hidden_dim]
-        features = features.reshape(T, B, -1)  # shape: [T, B, hidden_dim]
-        
-        # Mamba's full-sequence forward pass expects input of shape [B, L, D]
-        features = features.transpose(0, 1)  # shape: [B, T, hidden_dim]
-        
-        # Build an inference_params object that carries the initial state
-        if init_mamba_state is not None:
-            inference_params = SimpleNamespace(
-                key_value_memory_dict = { self.mamba.layer_idx: init_mamba_state },
-                seqlen_offset = 0
-            )
-        else:
-            inference_params = None
-
-        # Call the full-sequence forward pass
-        out = self.mamba(features, inference_params=inference_params)  # shape: [B, T, hidden_dim]
-        
-        # Apply post-processing and residual connection
-        out = self.post_mamba_mlp(out) + features
-        out = self.norm(out)
-        
-        # Transpose back to time-first: [T, B, hidden_dim]
-        out = out.transpose(0, 1)
-        return out
-
     def get_value(self, x, mamba_state):
-        """
-        x: (B, obs_dim)
-        mamba_state: tuple (conv_state, ssm_state)
-        """
-        encoded = self.get_states(x)  # (B, hidden_dim)
+        encoded = self.get_states(x)
         current = encoded.unsqueeze(1)  # (B, 1, hidden_dim)
         out, new_conv_state, new_ssm_state = self.mamba.step(current, mamba_state[0], mamba_state[1])
-        
-        # Apply post-processing and residual connection
         out = self.post_mamba_mlp(out) + current
         out = self.norm(out)
-        
         hidden = out.squeeze(1)  # (B, hidden_dim)
         value = self.critic(hidden).flatten()
         return value, (new_conv_state, new_ssm_state)
 
     def get_action_and_value(self, x, mamba_state, action=None):
-        """
-        Returns:
-          action, log_prob, entropy, value, new_mamba_state
-        """
         encoded = self.get_states(x)
         current = encoded.unsqueeze(1)
         out, new_conv_state, new_ssm_state = self.mamba.step(current, mamba_state[0], mamba_state[1])
-        
-        # Apply post-processing and residual connection
         out = self.post_mamba_mlp(out) + current
         out = self.norm(out)
-        
         hidden = out.squeeze(1)
-        value = self.critic(hidden)
-        if self.is_continuous:
-            action_mean = self.actor_mean(hidden)
-            action_logstd = self.actor_logstd.expand_as(action_mean)
-            action_std = torch.exp(action_logstd)
-            probs = Normal(action_mean, action_std)
-            if action is None:
-                action = probs.sample()
-            logprob = probs.log_prob(action).sum(-1)
-            entropy = probs.entropy().sum(-1)
-        else:
-            logits = self.actor(hidden)
-            probs = Categorical(logits=logits)
-            if action is None:
-                action = probs.sample()
-            logprob = probs.log_prob(action)
-            entropy = probs.entropy()
-        return action, logprob, entropy, value.flatten(), (new_conv_state, new_ssm_state)
+        logits = self.actor(hidden)
+        probs = Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden), (new_conv_state, new_ssm_state)
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -235,41 +193,31 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     torch.set_default_device(device)
 
-    # Environment setup - enhanced with support for multiple env types including Mujoco
+    # Environment setup
     if "ale" in args.gym_id.lower():
         envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                  run_name, frame_stack=1) for i in range(args.num_envs)]
+                                   run_name, frame_stack=1) for i in range(args.num_envs)]
     elif "minigrid" in args.gym_id.lower():
         envs_lst = [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                     run_name, agent_view_size=3, tile_size=28, max_episode_steps=96) for i in range(args.num_envs)]
+                                      run_name, agent_view_size=3, tile_size=28, max_episode_steps=96) for i in range(args.num_envs)]
     elif "poc" in args.gym_id.lower():
         envs_lst = [make_poc_env(args.gym_id, args.seed + i, i, args.capture_video,
-                                run_name, step_size=0.02, glob=False, freeze=True, max_episode_steps=96) for i in range(args.num_envs)]
+                                 run_name, step_size=0.02, glob=False, freeze=True, max_episode_steps=96) for i in range(args.num_envs)]
     elif args.gym_id == "MortarMayhem-Grid-v0":
         envs_lst = [make_memory_gym_env(args.gym_id, args.seed + i, i, args.capture_video,
-                                       run_name) for i in range(args.num_envs)]
+                                        run_name) for i in range(args.num_envs)]
     elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
         envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
-                                       run_name) for i in range(args.num_envs)]
+                                        run_name) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                    run_name, masked_indices=args.masked_indices) for i in range(args.num_envs)]
-    
+                                     run_name) for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(envs_lst)
-    agent = Agent(envs, args).to(device)
-    
-    # Separate learning rates for Mamba vs other parameters
-    optimizer = optim.Adam([
-        {"params": agent.encoder.parameters()},
-        {"params": agent.norm.parameters()},
-        {"params": agent.post_mamba_mlp.parameters()},
-        {"params": agent.critic.parameters()},
-        {"params": agent.actor.parameters() if not agent.is_continuous else 
-                  list(agent.actor_mean.parameters()) + [agent.actor_logstd]},
-        {"params": agent.mamba.parameters(), "lr": args.mamba_lr}
-    ], lr=args.learning_rate, eps=1e-5)
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    # Log parameter counts
+    agent = Agent(envs, args).to(device)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
     total_params = sum(p.numel() for p in agent.parameters())
     trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
     if args.track:
@@ -277,7 +225,7 @@ if __name__ == "__main__":
             "total_parameters": total_params,
             "trainable_parameters": trainable_params
         }, allow_val_change=True)
-    print(f"Total parameters: {total_params}, trainable parameters: {trainable_params / 1e6:.4f}M")
+    print(f"Total parameters: {total_params / 10e6:.4f}M, trainable parameters: {trainable_params / 10e6:.4f}M")
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -294,8 +242,6 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=[args.seed + i for i in range(args.num_envs)])
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-    
-    # Allocate the recurrent state for Mamba
     conv_state, ssm_state = agent.mamba.allocate_inference_cache(args.num_envs, max_seqlen=1)
     next_mamba_state = (conv_state, ssm_state)
     num_updates = args.total_timesteps // args.batch_size
@@ -303,15 +249,11 @@ if __name__ == "__main__":
     for update in range(1, num_updates + 1):
         update_start_time = time.time()
         initial_mamba_state = (next_mamba_state[0].clone(), next_mamba_state[1].clone())
-        
         # Annealing the learning rate
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
-            # Also anneal the Mamba learning rate
-            mamba_lrnow = frac * args.mamba_lr
-            optimizer.param_groups[-1]["lr"] = mamba_lrnow
 
         inference_time_total = 0.0
         for step in range(0, args.num_steps):
@@ -319,7 +261,7 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
 
-            # Action logic with timing
+            # Action logic
             inf_start = time.time()
             with torch.no_grad():
                 action, logprob, _, value, next_mamba_state = agent.get_action_and_value(
@@ -337,13 +279,11 @@ if __name__ == "__main__":
             next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.Tensor(done).to(device)
 
-            # If an environment is done, reset its Mamba state
             for env_id, d in enumerate(done):
                 if d:
                     next_mamba_state[0][env_id].zero_()
                     next_mamba_state[1][env_id].zero_()
 
-            # Process episode information
             final_info = info.get('final_info')
             if final_info is not None and len(final_info) > 0:
                 valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
@@ -356,7 +296,6 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episode_return", avg_return, global_step)
                     writer.add_scalar("charts/episode_length", avg_length, global_step)
 
-        # Log inference performance
         avg_inference_latency = inference_time_total / args.num_steps
         writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
 
@@ -382,7 +321,7 @@ if __name__ == "__main__":
         envsperbatch = args.num_envs // args.num_minibatches
         envinds = np.arange(args.num_envs)
         flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
-        
+
         # Initialize accumulators for metrics
         clipfracs = []
         total_loss_list = []
@@ -401,39 +340,33 @@ if __name__ == "__main__":
                 mbenvinds = envinds[start:end]
                 mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
 
-                # Get the initial Mamba state for this minibatch from the rollout
-                init_state = (initial_mamba_state[0][mbenvinds].clone(),
-                             initial_mamba_state[1][mbenvinds].clone())
+                mb_obs = obs[:, mbenvinds]       # shape: [T, minibatch_size, ...]
+                mb_dones = dones[:, mbenvinds]     # shape: [T, minibatch_size]
 
-                # Slice the rollout
-                mb_obs = obs[:, mbenvinds]  # shape: [T, minibatch_size, H, W, C]
-                
-                # Process the entire sequence with Mamba
-                full_seq_output = agent.forward_sequence(mb_obs, init_state)  # shape: [T, minibatch_size, hidden_dim]
+                # Get the initial Mamba state for this minibatch (cloned from the rollout)
+                init_state = (
+                    initial_mamba_state[0][mbenvinds].clone(),
+                    initial_mamba_state[1][mbenvinds].clone()
+                )
+
+                # Pass the dones into forward_sequence:
+                full_seq_output = agent.forward_sequence(mb_obs, init_state, dones=mb_dones)  # shape: [T, minibatch_size, hidden_dim]
                 T, B, hidden_dim = full_seq_output.shape
                 flat_features = full_seq_output.reshape(-1, hidden_dim)  # shape: [T*B, hidden_dim]
-                mb_actions = b_actions[mb_inds]
 
-                if agent.is_continuous:
-                    action_mean = agent.actor_mean(flat_features)
-                    action_logstd = agent.actor_logstd.expand_as(action_mean)
-                    action_std = torch.exp(action_logstd)
-                    probs = Normal(action_mean, action_std)
-                    new_logprobs = probs.log_prob(mb_actions).sum(-1)
-                    new_entropies = probs.entropy().sum(-1)
-                else:
-                    logits = agent.actor(flat_features)
-                    probs = Categorical(logits=logits)
-                    new_logprobs = probs.log_prob(mb_actions.long().squeeze(-1))
-                    new_entropies = probs.entropy()
-                
+                # Get logits and values:
+                logits = agent.actor(flat_features)                      # shape: [T*B, num_actions]
+                probs = Categorical(logits=logits)
+                new_logprobs = probs.log_prob(b_actions[mb_inds])
+                new_entropies = probs.entropy()
                 new_values = agent.critic(flat_features).reshape(-1)
 
-                # Compute the ratio and approximate KL divergence
+                # Compute the ratio and approximate KL divergence:
                 logratio = new_logprobs - b_logprobs[mb_inds]
                 ratio = logratio.exp()
-                
+
                 with torch.no_grad():
+                    # Calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
@@ -452,23 +385,18 @@ if __name__ == "__main__":
                     mb_values_flat = b_values[mb_inds]
                     v_loss_unclipped = (new_values - b_returns[mb_inds]) ** 2
                     v_clipped = mb_values_flat + torch.clamp(new_values - mb_values_flat,
-                                                           -args.clip_coef, args.clip_coef)
+                                                            -args.clip_coef, args.clip_coef)
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
                 else:
                     v_loss = 0.5 * ((new_values - b_returns[mb_inds]) ** 2).mean()
 
-                # Entropy loss
                 entropy_loss = new_entropies.mean()
 
-                # Total loss
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                # Gradient step
                 optimizer.zero_grad()
                 loss.backward()
-                
-                # Calculate gradient norms for logging
                 total_grad_norm = 0.0
                 for p in agent.parameters():
                     if p.grad is not None:
@@ -482,8 +410,6 @@ if __name__ == "__main__":
                         mamba_grad_norm += p.grad.data.norm(2).item() ** 2
                 mamba_grad_norm = mamba_grad_norm ** 0.5
                 mamba_grad_norm_list.append(mamba_grad_norm)
-                
-                # Clip gradients
                 grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
@@ -492,15 +418,16 @@ if __name__ == "__main__":
                 pg_loss_list.append(pg_loss.item())
                 v_loss_list.append(v_loss.item())
                 entropy_list.append(entropy_loss.item())
+                #grad_norm_list.append(grad_norm.item())
+                #mamba_grad_norm_list.append(mamba_grad_norm.item())
                 approx_kl_list.append(approx_kl.item())
                 old_approx_kl_list.append(old_approx_kl.item())
 
-            # Early stopping based on KL divergence
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
 
-        # Compute metrics means
+        # Compute means
         avg_total_loss = np.mean(total_loss_list)
         avg_pg_loss = np.mean(pg_loss_list)
         avg_v_loss = np.mean(v_loss_list)
@@ -510,22 +437,16 @@ if __name__ == "__main__":
         avg_approx_kl = np.mean(approx_kl_list)
         avg_old_approx_kl = np.mean(old_approx_kl_list)
 
-        # Calculate explained variance
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # Log performance metrics
         sps = int(global_step / (time.time() - start_time))
         current_return = np.mean([ep['r'] for ep in episode_infos]) if episode_infos else 0.0
-        
         print(f"Update {update}: SPS={sps}, Return={current_return:.2f}, "
-              f"pi_loss={avg_pg_loss:.6f}, v_loss={avg_v_loss:.6f}, entropy={avg_entropy:.6f}, "
+              f"pi_loss={pg_loss.item():.6f}, v_loss={v_loss.item():.6f}, entropy={entropy_loss.item():.6f}, "
               f"explained_var={explained_var:.6f}")
-              
-        # Log to the writer
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("charts/mamba_learning_rate", optimizer.param_groups[-1]["lr"], global_step)
         writer.add_scalar("losses/total_loss", avg_total_loss, global_step)
         writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
         writer.add_scalar("losses/policy_loss", avg_pg_loss, global_step)
@@ -543,27 +464,26 @@ if __name__ == "__main__":
             avg_episode_return = np.mean([ep['r'] for ep in episode_infos])
             writer.add_scalar("charts/avg_episode_return", avg_episode_return, global_step)
 
-        # Log training update duration
+        # Log training update duration (wall-clock time per update)
         update_time = time.time() - update_start_time
         writer.add_scalar("metrics/training_time_per_update", update_time, global_step)
         
         # Log GPU memory usage
-        if torch.cuda.is_available():
-            gpu_memory_allocated = torch.cuda.memory_allocated(device)  
-            gpu_memory_reserved = torch.cuda.memory_reserved(device)
-            total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
+        gpu_memory_allocated = torch.cuda.memory_allocated(device)  
+        gpu_memory_reserved = torch.cuda.memory_reserved(device)
+        total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
 
-            gpu_memory_allocated_gb = gpu_memory_allocated / (1024**3)
-            gpu_memory_reserved_gb = gpu_memory_reserved / (1024**3)
-            gpu_memory_allocated_percent = (gpu_memory_allocated / total_gpu_memory) * 100
-            gpu_memory_reserved_percent = (gpu_memory_reserved / total_gpu_memory) * 100
+        gpu_memory_allocated_gb = gpu_memory_allocated / (1024**3)
+        gpu_memory_reserved_gb = gpu_memory_reserved / (1024**3)
+        gpu_memory_allocated_percent = (gpu_memory_allocated / total_gpu_memory) * 100
+        gpu_memory_reserved_percent = (gpu_memory_reserved / total_gpu_memory) * 100
 
-            writer.add_scalar("metrics/GPU_memory_allocated_GB", gpu_memory_allocated_gb, global_step)
-            writer.add_scalar("metrics/GPU_memory_reserved_GB", gpu_memory_reserved_gb, global_step)
-            writer.add_scalar("metrics/GPU_memory_allocated_percent", gpu_memory_allocated_percent, global_step)
-            writer.add_scalar("metrics/GPU_memory_reserved_percent", gpu_memory_reserved_percent, global_step)
+        writer.add_scalar("metrics/GPU_memory_allocated_GB", gpu_memory_allocated_gb, global_step)
+        writer.add_scalar("metrics/GPU_memory_reserved_GB", gpu_memory_reserved_gb, global_step)
+        writer.add_scalar("metrics/GPU_memory_allocated_percent", gpu_memory_allocated_percent, global_step)
+        writer.add_scalar("metrics/GPU_memory_reserved_percent", gpu_memory_reserved_percent, global_step)
         
-        # Save model checkpoint
+        # Save model checkpoint every save_interval updates
         if args.save_model and update % args.save_interval == 0:
             model_path = f"runs/{run_name}/{args.exp_name}_update_{update}.cleanrl_model"
             model_data = {
@@ -573,5 +493,4 @@ if __name__ == "__main__":
             torch.save(model_data, model_path)
             print(f"Model saved to {model_path}")
         
-    # Cleanup
     finish_logging(args, writer, run_name, envs)

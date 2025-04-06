@@ -15,7 +15,7 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 
-from mamba_ssm import Mamba
+from mamba_ssm import Mamba2
 
 from gae import compute_advantages
 from env_utils import make_minigrid_env, make_atari_env, make_poc_env, make_classic_env, make_memory_gym_env, make_continuous_env
@@ -91,7 +91,7 @@ class Agent(nn.Module):
             )
 
         # Mamba model
-        self.mamba = Mamba(
+        self.mamba = Mamba2(
             d_model=args.hidden_dim,
             d_state=args.d_state,
             d_conv=args.d_conv,

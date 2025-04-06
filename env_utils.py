@@ -11,6 +11,54 @@ import minigrid
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from envs.poc_memory_env import PocMemoryEnv
 from envs.cartpole_wrapper import CartPoleWrapper
+from collections import deque
+
+class VecObservationStackWrapper(gym.ObservationWrapper):
+    def __init__(self, env, num_stack):
+        super().__init__(env)
+        self.num_stack = num_stack
+        self.frames = deque(maxlen=num_stack)
+        # Ensure the low/high bounds are NumPy arrays and repeat them along the stacking axis.
+        low = np.repeat(np.array(env.observation_space.low, dtype=np.float32), num_stack, axis=0)
+        high = np.repeat(np.array(env.observation_space.high, dtype=np.float32), num_stack, axis=0)
+        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+
+    def reset(self, **kwargs):
+        # Reset the underlying env and ensure the observation is a NumPy array.
+        obs, info = self.env.reset(**kwargs)
+        obs = np.array(obs, dtype=np.float32)
+        # Initialize the buffer with copies of the initial observation.
+        self.frames = deque([obs.copy() for _ in range(self.num_stack)], maxlen=self.num_stack)
+        return self._get_obs(), info
+
+    def observation(self, observation):
+        observation = np.array(observation, dtype=np.float32)
+        # Append a copy to ensure consistency.
+        self.frames.append(observation.copy())
+        return self._get_obs()
+
+    def _get_obs(self):
+        # Concatenate along the first axis.
+        return np.concatenate(list(self.frames), axis=0)
+
+class MaskObservationWrapper(gym.ObservationWrapper):
+    def __init__(self, env, mask_indices, mask_prob=1.0):
+        super().__init__(env)
+        self.mask_indices = mask_indices
+        self.mask_prob = mask_prob
+
+        # Keep original bounds for observation space (unchanged)
+        self.observation_space = env.observation_space
+
+    def observation(self, observation):
+        observation = np.array(observation, dtype=np.float32)
+
+        # Apply 50% masking probability for each index
+        for i in self.mask_indices:
+            if np.random.rand() < self.mask_prob:
+                observation[i] = 0.0
+
+        return observation
 
 class RecordEpisodeStatistics(gym.Wrapper):
   def __init__(self, env, deque_size=100):
@@ -80,7 +128,7 @@ def make_atari_env(gym_id, seed, idx, capture_video, run_name, frame_stack=1):
         return env
     return thunk
 
-def make_classic_env(gym_id, seed, idx, capture_video, run_name):
+def make_classic_env(gym_id, seed, idx, capture_video, run_name, masked_indices=[], obs_stack=1):
     def thunk():
         if "CartPoleMasked" in gym_id:
             env = CartPoleWrapper(
@@ -91,6 +139,10 @@ def make_classic_env(gym_id, seed, idx, capture_video, run_name):
             )
         else:
             env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
+            if masked_indices:
+                env = MaskObservationWrapper(env, masked_indices)
+            if obs_stack > 1:
+                env = VecObservationStackWrapper(env, num_stack=obs_stack)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
@@ -117,7 +169,7 @@ def make_memory_gym_env(gym_id, seed, idx, capture_video, run_name):
 
     return thunk
 
-def make_minigrid_env(gym_id, seed, idx, capture_video, run_name, agent_view_size=3, tile_size=28, max_episode_steps=96):
+def make_minigrid_env(gym_id, seed, idx, capture_video, run_name, agent_view_size=3, tile_size=28, max_episode_steps=96, frame_stack=1):
     def thunk():
         env = gym.make(
             gym_id,
@@ -126,6 +178,8 @@ def make_minigrid_env(gym_id, seed, idx, capture_video, run_name, agent_view_siz
             render_mode="rgb_array" if capture_video else None,
         )
         env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=tile_size))
+        if frame_stack > 1:
+            env = gym.wrappers.FrameStack(env, frame_stack)
         env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")

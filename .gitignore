@@ -9,6 +9,8 @@ checkpoints/
 *.yml
 model/
 *.pkl
+swig*
+
 
 # assets
 *.png

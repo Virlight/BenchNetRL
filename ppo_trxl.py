@@ -40,8 +40,10 @@ def parse_args():
         help="initial entropy coefficient")
     parser.add_argument("--final-ent-coef", type=float, default=0.000001,
         help="final entropy coefficient after annealing")
-    
+    parser.add_argument("--masked-indices", type=str, default="1,3",
+        help="indices of the observations to mask")
     args = parser.parse_args()
+    args.masked_indices = [int(x) for x in args.masked_indices.split(',')]
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -188,7 +190,7 @@ if __name__ == "__main__":
                                         run_name) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                     run_name) for i in range(args.num_envs)]
+                                     run_name, masked_indices=args.masked_indices) for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(envs_lst)
 
     env_current_episode_step = torch.zeros((args.num_envs,), dtype=torch.long)
