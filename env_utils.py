@@ -130,19 +130,11 @@ def make_atari_env(gym_id, seed, idx, capture_video, run_name, frame_stack=1):
 
 def make_classic_env(gym_id, seed, idx, capture_video, run_name, masked_indices=[], obs_stack=1):
     def thunk():
-        if "CartPoleMasked" in gym_id:
-            env = CartPoleWrapper(
-                "CartPole-v1",
-                reset_params={"start-seed": 0, "num-seeds": 100, "mask-velocity": True},
-                realtime_mode=capture_video,
-                record_trajectory=capture_video,
-            )
-        else:
-            env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
-            if masked_indices:
-                env = MaskObservationWrapper(env, masked_indices)
-            if obs_stack > 1:
-                env = VecObservationStackWrapper(env, num_stack=obs_stack)
+        env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
+        if masked_indices:
+            env = MaskObservationWrapper(env, masked_indices)
+        if obs_stack > 1:
+            env = VecObservationStackWrapper(env, num_stack=obs_stack)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video and idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")

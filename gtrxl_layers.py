@@ -105,7 +105,7 @@ class GatedTransformerLayer(nn.Module):
         self.ffn_gate = GatingMechanism(dim)
 
     def forward(self, value, key, query, mask):
-        # Pre-layer normalization
+        # Pre-layer normalization (post-layer normalization is usually less effective)
         query_ = self.layer_norm_q(query)
         value = self.norm_kv(value)
         key = value  # K = V -> self-attention
@@ -156,4 +156,5 @@ class GatedTransformer(nn.Module):
             x = x.squeeze()
             if len(x.shape) == 1:
                 x = x.unsqueeze(0)
-        return x, torch.stack(out_memories, dim=1) 
+        return x, torch.stack(out_memories, dim=1)
+
