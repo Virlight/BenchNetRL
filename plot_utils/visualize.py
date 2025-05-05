@@ -1,7 +1,7 @@
 import tensorflow as tf
 import os
 import glob
-import utils  # Your utils.py functions
+import utils
 
 def find_event_file_in_folder(folder_path):
     """Finds the (assumed single) TensorBoard event file in a given folder."""
@@ -73,15 +73,6 @@ def print_tfevents(file_path):
 
 if __name__ == "__main__":
     folder_groups = [
-        # [
-        #     "runs\CartPole-v1__ppo__1__1736687598"
-        # ],
-        # [
-        #     "runs\CartPole-v1__ppo__1__1736687709"
-        # ],
-        # [
-        #     "runs\CartPole-v1__ppo__2__1736687660"
-        # ],
         [
             "runs\CartPole-v1__ppo__1__1736687709",
             "runs\CartPole-v1__ppo__2__1736687660"
@@ -90,17 +81,9 @@ if __name__ == "__main__":
             "runs\CartPole-v1__ppo__1__1736687709",
             "runs\CartPole-v1__ppo__2__1736687660",
             "runs\CartPole-v1__ppo__3__1736688619",
-            "runs\CartPole-v1__ppo__4__1736688670",
-            "runs\CartPole-v1__ppo__5__1736688719",
-            "runs\CartPole-v1__ppo__6__1736688815",
-            "runs\CartPole-v1__ppo__7__1736688906",
-            "runs\CartPole-v1__ppo__8__1736688952",
-            "runs\CartPole-v1__ppo__9__1736688997",
-            "runs\CartPole-v1__ppo__10__1736689043"
         ]
     ]
     labels = ["PPO-Combined2", "PPO-Combined10"]
-    #print_tfevents("runs\CartPole-v1__ppo__1__1728577357\events.out.tfevents.1728577357.Tornadosky.22916.0")
 
     visualize_from_tfevents(
         folder_groups=folder_groups,

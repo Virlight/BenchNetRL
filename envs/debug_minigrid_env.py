@@ -6,9 +6,9 @@ from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 def make_env(gym_id="MiniGrid-MemoryS17Random-v0", seed=1):
     env = gym.make(
         gym_id,
-        agent_view_size=3,  # just as an example
+        agent_view_size=3,
         tile_size=16,
-        render_mode="rgb_array",  # needed for us to get image observations
+        render_mode="rgb_array",
     )
     env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=16))
     env = gym.wrappers.TimeLimit(env, max_episode_steps=96)
@@ -28,7 +28,7 @@ def debug_minigrid_plot_12():
     print("Action space:", env.action_space)
     print("Observation space:", env.observation_space)
 
-    # We'll store up to 12 steps of (observation, action)
+    # We'll store up to X steps of (observation, action)
     steps_to_plot = 36
     observations = []
     actions = []
@@ -37,9 +37,9 @@ def debug_minigrid_plot_12():
     observations.append(obs)
     actions.append(-1)  # no action led to the initial state, so store a placeholder
 
-    # 4. Step through the environment, restricting actions to {0,1,2,3}
+    # 4. Step through the environment, restricting actions to {0,1,2}
     for i in range(steps_to_plot):
-        # Sample from {0,1,2,3} only
+        # Sample from {0,1,2} only
         action = np.random.choice([0,1,2])
         obs, reward, done, truncated, info = env.step(action)
 
@@ -51,12 +51,8 @@ def debug_minigrid_plot_12():
         if done or truncated:
             obs, info = env.reset()
 
-    # 5. Plot the 12 resulting observations
-    # Actually we have 13 total observations: the initial + 12 after each action
-    # We'll show the 12 *new* ones or you can choose to show all 13
-    # Here we show all 12 steps in a 3x4 grid
-
-    rows, cols = 6, 6 # 5x5 grid for 25 steps
+    # 5. Plot resulting observations
+    rows, cols = 6, 6
     fig, axs = plt.subplots(rows, cols, figsize=(12, 8))
 
     for idx in range(1, steps_to_plot + 1):

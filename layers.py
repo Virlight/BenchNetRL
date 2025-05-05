@@ -32,6 +32,19 @@ class PositionalEncoding(nn.Module):
         pos_emb = torch.cat((sinusoidal_inp.sin(), sinusoidal_inp.cos()), dim=-1)
         return pos_emb
 
+class GatingMechanism(nn.Module):
+    """Gating mechanism for GTRXL"""
+    def __init__(self, dim):
+        super().__init__()
+        self.gating_layer = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x, y):
+        """Apply gating mechanism between x and y"""
+        gate = self.gating_layer(x)
+        return gate * y + (1 - gate) * x
 
 class MultiHeadAttention(nn.Module):
     """Multi Head Attention without dropout inspired by https://github.com/aladdinpersson/Machine-Learning-Collection"""
@@ -80,13 +93,17 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, is_gated=False):
         super().__init__()
         self.attention = MultiHeadAttention(dim, num_heads)
         self.layer_norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
         self.layer_norm_attn = nn.LayerNorm(dim)
         self.fc_projection = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
+        self.is_gated = is_gated
+        # Gating mechanisms
+        self.attn_gate = GatingMechanism(dim)
+        self.ffn_gate = GatingMechanism(dim)
 
     def forward(self, value, key, query, mask):
         # Pre-layer normalization (post-layer normalization is usually less effective)
@@ -94,15 +111,21 @@ class TransformerLayer(nn.Module):
         value = self.norm_kv(value)
         key = value  # K = V -> self-attention
         attention, attention_weights = self.attention(value, key, query_, mask)  # MHA
-        x = attention + query  # Skip connection
+        if self.is_gated:
+            x = self.attn_gate(query, attention)
+        else:
+            x = attention + query  # Skip connection
         x_ = self.layer_norm_attn(x)  # Pre-layer normalization
         forward = self.fc_projection(x_)  # Forward projection
-        out = forward + x  # Skip connection
+        if self.is_gated:
+            out = self.ffn_gate(x, forward)
+        else:
+            out = forward + x  # Skip connection
         return out, attention_weights
 
 
 class Transformer(nn.Module):
-    def __init__(self, num_layers, dim, num_heads, max_episode_steps, positional_encoding):
+    def __init__(self, num_layers, dim, num_heads, max_episode_steps, positional_encoding, is_gated=False):
         super().__init__()
         self.max_episode_steps = max_episode_steps
         self.positional_encoding = positional_encoding
@@ -110,7 +133,7 @@ class Transformer(nn.Module):
             self.pos_embedding = PositionalEncoding(dim)
         elif positional_encoding == "learned":
             self.pos_embedding = nn.Parameter(torch.randn(max_episode_steps, dim))
-        self.transformer_layers = nn.ModuleList([TransformerLayer(dim, num_heads) for _ in range(num_layers)])
+        self.transformer_layers = nn.ModuleList([TransformerLayer(dim, num_heads, is_gated=is_gated) for _ in range(num_layers)])
 
     def forward(self, x, memories, mask, memory_indices):
         # Add positional encoding to every transformer layer input

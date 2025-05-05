@@ -48,9 +48,8 @@ def debug_pom_env_with_render():
 
     env.close()
 
-    # Display collected frames as an animation
     fig = plt.figure()
-    plt.axis('off')  # Hide axes for clarity
+    plt.axis('off')
 
     def update(frame_idx):
         plt.imshow(frames[frame_idx])
@@ -58,10 +57,6 @@ def debug_pom_env_with_render():
 
     ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=300, repeat=False)
     plt.show()
-
-    # Optionally: Save animation as a GIF using imageio
-    # import imageio
-    # imageio.mimsave('pom_env_animation.gif', frames, fps=3)
 
 if __name__ == "__main__":
     debug_pom_env_with_render()

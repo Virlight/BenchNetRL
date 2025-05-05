@@ -63,8 +63,6 @@ def debug_poc_memory_env():
     fig, ax = plt.subplots(figsize=(8, 4))
 
     # Plot the agent position
-    #print("Agent positions:", position_list)
-    #print("Actions taken:", steps_range)
     ax.plot(steps_range, position_list, marker='o', label='Agent position')
 
     # If you want to highlight left/right goal from the *first* observation

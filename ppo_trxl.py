@@ -32,6 +32,8 @@ def parse_args():
         help="the length of TrXL's sliding memory window")
     parser.add_argument("--trxl-positional-encoding", type=str, default="absolute",
         help='the positional encoding type: "", "absolute", "learned"')
+    parser.add_argument("--gating", type=strtobool, default=False,
+        help="whether to use gating in the transformer")
     parser.add_argument("--reconstruction-coef", type=float, default=0.0,
         help="the coefficient of the observation reconstruction loss")
     parser.add_argument("--final-lr", type=float, default=1.0e-5,
@@ -94,7 +96,8 @@ class Agent(nn.Module):
         # Transformer model
         self.transformer = Transformer(
             args.trxl_num_layers, args.trxl_dim, args.trxl_num_heads, 
-            self.max_episode_steps, args.trxl_positional_encoding
+            self.max_episode_steps, args.trxl_positional_encoding,
+            is_gated=self.args.gating
         )
 
         self.hidden_post_trxl = nn.Sequential(
