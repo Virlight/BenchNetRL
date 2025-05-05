@@ -10,7 +10,6 @@ from stable_baselines3.common.atari_wrappers import (
 import minigrid
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from envs.poc_memory_env import PocMemoryEnv
-from envs.cartpole_wrapper import CartPoleWrapper
 from collections import deque
 
 class VecObservationStackWrapper(gym.ObservationWrapper):
@@ -188,9 +187,11 @@ def make_poc_env(gym_id, seed, idx, capture_video, run_name, step_size=0.2, glob
         return env
     return thunk
 
-def make_continuous_env(gym_id, seed, idx, capture_video, run_name):
+def make_continuous_env(gym_id, seed, idx, capture_video, run_name, obs_stack=1):
     def thunk():
         env = gym.make(gym_id, render_mode="rgb_array") if capture_video else gym.make(gym_id)
+        if obs_stack > 1:
+            env = VecObservationStackWrapper(env, num_stack=obs_stack)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)

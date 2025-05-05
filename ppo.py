@@ -196,7 +196,7 @@ if __name__ == "__main__":
                                         run_name) for i in range(args.num_envs)]
     elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
         envs_lst = [make_continuous_env(args.gym_id, args.seed + i, i, args.capture_video,
-                                        run_name) for i in range(args.num_envs)]
+                                        run_name, obs_stack=args.obs_stack) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                      run_name, masked_indices=args.masked_indices, obs_stack=args.obs_stack) for i in range(args.num_envs)]
