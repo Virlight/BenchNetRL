@@ -28,7 +28,10 @@ def parse_args():
         help="Type of recurrent cell to use: 'lstm' or 'gru'")
     parser.add_argument("--rnn-hidden-dim", type=int, default=512,
         help="the hidden dimension of the rnn")
+    parser.add_argument("--masked-indices", type=str, default="1,3",
+        help="indices of the observations to mask")    
     args = parser.parse_args()
+    args.masked_indices = [int(x) for x in args.masked_indices.split(',')]
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
@@ -71,6 +74,10 @@ class Agent(nn.Module):
                 self.encoder = nn.Sequential(
                     nn.Flatten(),
                     nn.Linear(input_dim, self.args.hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(self.args.hidden_dim, self.args.hidden_dim//2),
+                    nn.ReLU(),
+                    nn.Linear(self.args.hidden_dim//2, self.args.hidden_dim),
                     nn.ReLU(),
                 )
         
@@ -190,7 +197,7 @@ if __name__ == "__main__":
                                         run_name) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                     run_name) for i in range(args.num_envs)]
+                                     run_name, masked_indices=args.masked_indices, obs_stack=1) for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(envs_lst)
 
     agent = Agent(envs, args).to(device)

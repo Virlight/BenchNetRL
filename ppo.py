@@ -24,7 +24,14 @@ def parse_args():
     add_common_args(parser)
     parser.add_argument("--hidden-dim", type=int, default=512,
         help="the hidden dimension of the model")
+    parser.add_argument("--obs-stack", type=int, default=1,
+        help="the number of frames to stack for the observation")
+    parser.add_argument("--masked-indices", type=str, default="1,3",
+        help="indices of the observations to mask")
+    parser.add_argument("--frame-stack", type=int, default=1,
+        help="frame stack for the environment")
     args = parser.parse_args()
+    args.masked_indices = [int(x) for x in args.masked_indices.split(',')]
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     return args
@@ -45,11 +52,28 @@ class Agent(nn.Module):
                 nn.Tanh(),
             )
         else:
-            if len(self.obs_space.shape) == 3:  # image observation
-                if self.obs_space.shape[0] in [1, 3, 4]:
-                    in_channels = self.obs_space.shape[0]  # channels-first (e.g., ALE/Breakout-v5)
-                else:
-                    in_channels = self.obs_space.shape[2]
+             # For image-based environments (e.g., Atari, Minigrid), use a conv encoder.
+            obs_shape = self.obs_space.shape
+            conv_input = False
+            in_channels = None
+
+            # Handle both non-stacked (3D) and stacked (4D) observations.
+            if isinstance(self.obs_space, gym.spaces.Box) and len(obs_shape) in [3, 4]:
+                if len(obs_shape) == 3:
+                    # e.g. (channels, height, width) or (height, width, channels)
+                    if obs_shape[0] in [1, 3, 4]:
+                        in_channels = obs_shape[0]
+                    else:
+                        in_channels = obs_shape[2]
+                    conv_input = True
+                elif len(obs_shape) == 4:
+                    # Shape is (frame_stack, height, width, channels)
+                    if obs_shape[-1] in [1, 3, 4]:
+                        # Combine frame stacking with channels.
+                        in_channels = obs_shape[0] * obs_shape[-1]
+                        conv_input = True
+
+            if conv_input:
                 self.encoder = nn.Sequential(
                     layer_init(nn.Conv2d(in_channels, 32, 8, stride=4)),
                     nn.ReLU(),
@@ -61,35 +85,54 @@ class Agent(nn.Module):
                     layer_init(nn.Linear(64 * 7 * 7, self.args.hidden_dim)),
                     nn.ReLU(),
                 )
-            else:  # vector observation
-                input_dim = np.prod(self.obs_space.shape)
+            else:
+                # Fallback to a vector encoder if not an image.
+                input_dim = np.prod(obs_shape)
                 self.encoder = nn.Sequential(
                     nn.Flatten(),
                     nn.Linear(input_dim, self.args.hidden_dim),
                     nn.ReLU(),
                 )
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(args.hidden_dim, args.hidden_dim // 2)),
+            layer_init(nn.Linear(args.hidden_dim, args.hidden_dim)),
             nn.ReLU(),
-            layer_init(nn.Linear(args.hidden_dim // 2, 1), std=1.0),
+            layer_init(nn.Linear(args.hidden_dim, args.hidden_dim)),
+            nn.ReLU(),
+            layer_init(nn.Linear(args.hidden_dim, 1), std=1.0),
         )
         
         if isinstance(envs.single_action_space, gym.spaces.Discrete):
             self.is_continuous = False
             self.actor = nn.Sequential(
-                layer_init(nn.Linear(args.hidden_dim, args.hidden_dim // 2)),
+                layer_init(nn.Linear(args.hidden_dim, args.hidden_dim)),
                 nn.ReLU(),
-                layer_init(nn.Linear(args.hidden_dim // 2, envs.single_action_space.n), std=0.01),
+                layer_init(nn.Linear(args.hidden_dim, args.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(args.hidden_dim, envs.single_action_space.n), std=0.01),
             )
         elif isinstance(envs.single_action_space, gym.spaces.Box):
             self.is_continuous = True
             action_dim = np.prod(envs.single_action_space.shape)
-            self.actor_mean = layer_init(nn.Linear(args.hidden_dim, action_dim), std=0.01)
+            self.actor_mean = nn.Sequential(
+                layer_init(nn.Linear(args.hidden_dim, args.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(args.hidden_dim, args.hidden_dim)),
+                nn.ReLU(),
+                layer_init(nn.Linear(args.hidden_dim, action_dim), std=0.01),
+            )
             self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
     
     def get_states(self, x):
         if "minigrid" in self.args.gym_id.lower() or "mortar" in self.args.gym_id.lower():
-            x = x.permute(0, 3, 1, 2) / 255.0
+            if x.ndim == 5:
+                # First, permute to (batch, frame_stack, channels, height, width)
+                x = x.permute(0, 1, 4, 2, 3)
+                # Then flatten the frame_stack and channel dimensions:
+                batch, fs, C, H, W = x.shape
+                x = x.reshape(batch, fs * C, H, W) / 255.0
+            else:
+                # If no frame stacking is applied, shape is (batch, height, width, channels)
+                x = x.permute(0, 3, 1, 2) / 255.0
         if "ale/" in self.args.gym_id.lower():
             x = x / 255.0
         hidden = self.encoder(x)
@@ -141,10 +184,10 @@ if __name__ == "__main__":
     # Environment setup
     if "ale" in args.gym_id.lower():
         envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                   run_name, frame_stack=1) for i in range(args.num_envs)]
+                                   run_name, frame_stack=args.frame_stack) for i in range(args.num_envs)]
     elif "minigrid" in args.gym_id.lower():
         envs_lst = [make_minigrid_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                      run_name, agent_view_size=3, tile_size=28, max_episode_steps=96) for i in range(args.num_envs)]
+                                      run_name, agent_view_size=3, tile_size=28, max_episode_steps=96, frame_stack=args.frame_stack) for i in range(args.num_envs)]
     elif "poc" in args.gym_id.lower():
         envs_lst = [make_poc_env(args.gym_id, args.seed + i, i, args.capture_video,
                                  run_name, step_size=0.02, glob=False, freeze=True, max_episode_steps=96) for i in range(args.num_envs)]
@@ -156,7 +199,7 @@ if __name__ == "__main__":
                                         run_name) for i in range(args.num_envs)]
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
-                                     run_name) for i in range(args.num_envs)]
+                                     run_name, masked_indices=args.masked_indices, obs_stack=args.obs_stack) for i in range(args.num_envs)]
     envs = gym.vector.SyncVectorEnv(envs_lst)
 
     agent = Agent(envs, args).to(device)

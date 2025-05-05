@@ -35,7 +35,7 @@ def parse_args():
         help="local convolution width for Mamba")
     parser.add_argument("--expand", type=int, default=2,
         help="expansion factor for the Mamba block")
-    parser.add_argument("--mamba-lr", type=float, default=1.5e-4,
+    parser.add_argument("--mamba-lr", type=float, default=1e-4,
         help="learning rate for Mamba parameters (lower than base LR)")
     parser.add_argument("--dt-init", type=str, default="constant", choices=["constant", "random"],
         help="Initialization method for dt projection weights")
