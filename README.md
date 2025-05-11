@@ -1,4 +1,23 @@
-# Benchmarking Neural Networks in Reinforcement Learning (PPO)
+<div align="center">
+  <a href="https://github.com/SafeRL-Lab/BenchNetRL">
+    <img src="https://github.com/SafeRL-Lab/BenchNetRL/blob/main/docs/benchnetrl-logo.png" alt="Logo" width="280"> 
+  </a>
+  
+<h1 align="center" style="font-size: 30px;"><strong><em>BenchNetRL</em></strong>:  Benchmarking Neural Networks in Reinforcement Learning</h1>
+<p align="center">
+    <a href="https://github.com/SafeRL-Lab/BenchNetRL/tree/main">Code</a>
+    ·
+    <a href="">Paper</a>
+    ·
+    <a href="https://github.com/SafeRL-Lab/BenchNetRL/issues">Issue</a>
+  </p>
+</div>
+
+
+ ---
+
+
+<!--# Benchmarking Neural Networks in Reinforcement Learning (PPO)-->
 
 Directory Structure
 
