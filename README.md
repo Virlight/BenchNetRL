@@ -1,6 +1,6 @@
 <div align="center">
   <a href="https://github.com/SafeRL-Lab/BenchNetRL">
-    <img src="https://github.com/SafeRL-Lab/BenchNetRL/blob/main/docs/benchnetrl-logo.png" alt="Logo" width="280"> 
+    <img src="https://github.com/SafeRL-Lab/BenchNetRL/blob/main/docs/benchnetrl-logo.png" alt="Logo" width="60%" height="60%"> 
   </a>
   
 <h1 align="center" style="font-size: 30px;"><strong><em>BenchNetRL</em></strong>:  Benchmarking Neural Networks in Reinforcement Learning</h1>
