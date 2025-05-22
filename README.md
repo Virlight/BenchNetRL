@@ -3,7 +3,7 @@
     <img src="https://github.com/SafeRL-Lab/BenchNetRL/blob/main/docs/benchnetrl-logo.png" alt="Logo" width="60%" height="60%"> 
   </a>
   
-<h1 align="center" style="font-size: 30px;"><strong><em>RLBenchNet</em></strong>:  The Right Network for the Right RL Task</h1>
+<h1 align="center" style="font-size: 30px;"><strong><em>BenchNetRL</em></strong>:  The Right Network for the Right RL Task</h1>
 <p align="center">
     <a href="https://github.com/SafeRL-Lab/BenchNetRL/tree/main">Code</a>
     ·
