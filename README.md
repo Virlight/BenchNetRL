@@ -182,7 +182,7 @@ If you find the repository useful, please cite the study
 @article{ivan2025benchnetrl,
   title={BenchNetRL: Benchmarking Neural Networks in Reinforcement Learning and Beyond},
   author={Smirnov, Ivan and Gu, Shangding},
-  journal={Github},
+  journal={Arxiv},
   year={2025}
 }
 ```
