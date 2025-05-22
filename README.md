@@ -7,7 +7,7 @@
 <p align="center">
     <a href="https://github.com/SafeRL-Lab/BenchNetRL/tree/main">Code</a>
     ·
-    <a href="">Paper</a>
+    <a href="https://arxiv.org/abs/2505.15040">Paper</a>
     ·
     <a href="https://github.com/SafeRL-Lab/BenchNetRL/issues">Issue</a>
   </p>
