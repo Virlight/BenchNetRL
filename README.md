@@ -22,7 +22,7 @@
 Directory Structure
 
 ```bash
-Mamba-RL/
+BenchNetRL/
 ├── README.md               # This file
 ├── requirements.txt        # Python dependencies
 ├── env_utils.py            # Environment wrappers and creators
@@ -180,7 +180,7 @@ Replace the script name (`ppo.py`, `ppo_lstm.py`, `ppo_mamba2.py`, `ppo_trxl.py`
 If you find the repository useful, please cite the study
 ``` Bash
 @article{ivan2025benchnetrl,
-  title={BenchNetRL: Benchmarking Neural Networks in Reinforcement Learning and Beyond},
+  title={RLBenchNet: The Right Network for the Right Reinforcement Learning Task},
   author={Smirnov, Ivan and Gu, Shangding},
   journal={Arxiv},
   year={2025}
