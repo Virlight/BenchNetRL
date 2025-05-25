@@ -43,7 +43,7 @@ BenchNetRL/
         └── mujoco.sh        # MuJoCo benchmark commands
 ```
 
-## Installation
+## ⚙️ Installation
 
 Clone the repository:
 
@@ -127,7 +127,7 @@ if torch.cuda.is_available() and hasattr(torch.cuda, "reset_peak_memory_stats"):
     torch.cuda.reset_peak_memory_stats()
 ```
 
-## Usage
+## 🚀 Usage
 
 ### Running the Experiments
 
@@ -186,8 +186,8 @@ Replace the script name (`ppo.py`, `ppo_lstm.py`, `ppo_mamba.py`, `ppo_trxl.py`)
 | **Steps Per Second** (↑)  | **3539** | _3305_ | 604   | 701   | 1856   | 1890   | 2734   | 2455    |
 | **Training Time (min)** (↓)| **16.59** | _18.84_ | 121.90 | 91.04 | 30.33  | 29.42  | _21.20_ | 22.97   |
 | **Inference Latency (ms)** (↓) | **0.856** | _0.899_ | 1.006  | 0.971  | 2.171  | 2.147  | 1.304  | 1.489   |
-| **GPU Memory Allocated (GB)** (↓) | **0.035** | _0.660_ | 0.194  | 0.194  | 1.765  | 1.330  | 0.217  | 0.219   |
-| **GPU Memory Reserved (GB)** (↓) | **0.327** | _0.983_ | 0.343  | 0.349  | 5.508  | 4.968  | 0.362  | 0.662   |
+| **GPU Mem. Allocated (GB)** (↓) | **0.035** | _0.660_ | 0.194  | 0.194  | 1.765  | 1.330  | 0.217  | 0.219   |
+| **GPU Mem. Reserved (GB)** (↓) | **0.327** | _0.983_ | 0.343  | 0.349  | 5.508  | 4.968  | 0.362  | 0.662   |
 
 Below are key performance metrics visualized by architecture group.
 
@@ -214,9 +214,9 @@ Below are key performance metrics visualized by architecture group.
 
 ### MuJoCo Environments
 <p align="center">
-  <a href="plots/walker.png"><img src="plots/walker.png" width="33%"/></a>
-  <a href="plots/hopper.png"><img src="plots/hopper.png" width="33%"/></a>
-  <a href="plots/halfcheetah.png"><img src="plots/halfcheetah.png" width="33%"/></a>
+  <a href="plots/walker.png"><img src="plots/walker.png" width="32%"/></a>
+  <a href="plots/hopper.png"><img src="plots/hopper.png" width="32%"/></a>
+  <a href="plots/halfcheetah.png"><img src="plots/halfcheetah.png" width="32%"/></a>
 </p>
 
 ---
