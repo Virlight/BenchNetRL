@@ -4,22 +4,19 @@
   </a>
   
 <h1 align="center" style="font-size: 30px;"><strong><em>BenchNetRL</em></strong>:  The Right Network for the Right RL Task</h1>
-<p align="center">
-    <a href="https://github.com/SafeRL-Lab/BenchNetRL/tree/main">Code</a>
-    ·
-    <a href="https://arxiv.org/abs/2505.15040">Paper</a>
-    ·
-    <a href="https://github.com/SafeRL-Lab/BenchNetRL/issues">Issue</a>
-  </p>
-</div>
 
+
+
+### 💻 [Code](https://github.com/SafeRL-Lab/BenchNetRL/tree/main) · 📄 [Paper](https://arxiv.org/abs/2505.15040) · 🚩 [Issues](https://github.com/SafeRL-Lab/BenchNetRL/issues)
+
+</div>
 
  ---
 
 
 <!--# Benchmarking Neural Networks in Reinforcement Learning (PPO)-->
 
-Directory Structure
+## Directory Structure
 
 ```bash
 BenchNetRL/
@@ -30,12 +27,11 @@ BenchNetRL/
 ├── gae.py                  # Generalized Advantage Estimation implementation
 ├── layers.py               # Neural network layer utilities and transformer modules
 ├── ppo.py                  # Vanilla PPO implementation
-├── ppo_lstm.py             # PPO with LSTM/GRU recurrent policies
-├── ppo_mamba.py            # PPO with Mamba recurrent SSM
-├── ppo_mamba2.py           # PPO with Mamba2 recurrent SSM
-├── ppo_trxl.py             # PPO with Transformer-XL memory
+├── ppo_lstm.py             # PPO with LSTM / GRU recurrent policies
+├── ppo_mamba.py            # PPO with Mamba / Mamba-2 recurrent SSM
+├── ppo_trxl.py             # PPO with Transformer-XL (TrXL) / GTrXL memory
 │
-├── envs/                   # Custom environment implementations
+├── envs/                   # Custom environment implementations for quick memory tests
 │   ├── poc_memory_env.py    # Proof-of-concept memory environment (PocMemoryEnv)
 │   └── pom_env.py           # Proof-of-memory Gym environment (PoMEnv)
 │
@@ -52,8 +48,8 @@ BenchNetRL/
 Clone the repository:
 
 ```bash
-git clone https://github.com/SafeRL-Lab/Mamba-RL.git
-cd Mamba-RL
+git clone https://github.com/SafeRL-Lab/BenchNetRL.git
+cd BenchNetRL
 ```
 
 Create a Python environment (recommended using conda or virtualenv):
@@ -78,7 +74,7 @@ Before installing CUDA-enabled PyTorch, make sure you have NVIDIA’s CUDA toolk
 
 2. Select CUDA Toolkit 12.4 for your operating system and follow the installation guide.
 
-Install Mamba/SSM library:
+### Install Mamba/SSM library:
 
 The Mamba and Mamba2 recurrent state-space models are required for ppo_mamba.py and ppo_mamba2.py. These modules are not included in this repository and must be installed separately. Ensure you are on a Linux system with a compatible CUDA version.
 
@@ -133,7 +129,7 @@ if torch.cuda.is_available() and hasattr(torch.cuda, "reset_peak_memory_stats"):
 
 ## Usage
 
-Running the Experiments
+### Running the Experiments
 
 Use the provided scripts under `scripts/ours/` to launch our experiments. For example:
 
@@ -158,7 +154,7 @@ python ppo_mamba.py \
   --exp-name ppo_mamba
 ```
 
-Replace the script name (`ppo.py`, `ppo_lstm.py`, `ppo_mamba2.py`, `ppo_trxl.py`) and flags as needed.
+Replace the script name (`ppo.py`, `ppo_lstm.py`, `ppo_mamba.py`, `ppo_trxl.py`) and flags as needed.
 
 ### File Descriptions
 
@@ -176,7 +172,80 @@ Replace the script name (`ppo.py`, `ppo_lstm.py`, `ppo_mamba2.py`, `ppo_trxl.py`
 
 - scripts/ours/: Shell scripts for reproducible benchmarks.
 
-## Citation
+## 📈 Performance Metrics - Average Across 9 Environments
+
+### Architectures
+
+- **PPO-1**: Standard PPO with **1-frame observation** (no frame stacking).
+- **PPO-4**: PPO with **4-frame observation stacking** (temporal context via stacked frames).
+- **LSTM, GRU, TrXL, GTrXL, Mamba, Mamba-2**: Sequence-based models with varying architectures to capture temporal dependencies in environment dynamics.
+
+
+| Metric              | PPO-1 | PPO-4 | LSTM  | GRU   | TrXL   | GTrXL  | Mamba  | Mamba-2 |
+|---------------------|-------|-------|-------|-------|--------|--------|--------|---------|
+| **Steps Per Second** (↑)  | **3539** | _3305_ | 604   | 701   | 1856   | 1890   | 2734   | 2455    |
+| **Training Time (min)** (↓)| **16.59** | _18.84_ | 121.90 | 91.04 | 30.33  | 29.42  | _21.20_ | 22.97   |
+| **Inference Latency (ms)** (↓) | **0.856** | _0.899_ | 1.006  | 0.971  | 2.171  | 2.147  | 1.304  | 1.489   |
+| **GPU Memory Allocated (GB)** (↓) | **0.035** | _0.660_ | 0.194  | 0.194  | 1.765  | 1.330  | 0.217  | 0.219   |
+| **GPU Memory Reserved (GB)** (↓) | **0.327** | _0.983_ | 0.343  | 0.349  | 5.508  | 4.968  | 0.362  | 0.662   |
+
+Below are key performance metrics visualized by architecture group.
+
+### 🟦 PPO | 🟧 Classic Seq | 🟩 Transformers | 🟥 Mamba
+
+<p align="center">
+  <a href="plots/steps_per_second.png">
+    <img src="plots/steps_per_second.png" width="24%" />
+  </a>
+  <a href="plots/training_time.png">
+    <img src="plots/training_time.png" width="24%" />
+  </a>
+  <a href="plots/inference_latency.png">
+    <img src="plots/inference_latency.png" width="24%" />
+  </a>
+  <a href="plots/gpu_memory_usage.png">
+    <img src="plots/gpu_memory_usage.png" width="24%" />
+  </a>
+</p>
+
+📝 *Each architecture is color-coded by family for quick reference.*
+
+## 📊 Results
+
+### MuJoCo Environments
+<p align="center">
+  <a href="plots/walker.png"><img src="plots/walker.png" width="33%"/></a>
+  <a href="plots/hopper.png"><img src="plots/hopper.png" width="33%"/></a>
+  <a href="plots/halfcheetah.png"><img src="plots/halfcheetah.png" width="33%"/></a>
+</p>
+
+---
+
+### Atari Environments
+<p align="center">
+  <a href="plots/breakout.png"><img src="plots/breakout.png" width="49%"/></a>
+  <a href="plots/pong.png"><img src="plots/pong.png" width="49%"/></a>
+</p>
+
+---
+
+### MiniGrid Environments
+<p align="center">
+  <a href="plots/doorkey.png"><img src="plots/doorkey.png" width="49%"/></a>
+  <a href="plots/memory.png"><img src="plots/memory.png" width="49%"/></a>
+</p>
+
+---
+
+### OpenAI Gym Environments
+<p align="center">
+  <a href="plots/cartpole.png"><img src="plots/cartpole.png" width="49%"/></a>
+  <a href="plots/lunarlander.png"><img src="plots/lunarlander.png" width="49%"/></a>
+</p>
+
+---
+
+## 📄 Citation
 If you find the repository useful, please cite the study
 ``` Bash
 @article{ivan2025benchnetrl,
@@ -186,6 +255,3 @@ If you find the repository useful, please cite the study
   year={2025}
 }
 ```
-
-
-
