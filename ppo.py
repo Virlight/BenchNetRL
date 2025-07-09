@@ -181,8 +181,12 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     torch.set_default_device(device)
 
+    print(f"Config Args: {args}")
+
     # Environment setup
     if "ale" in args.gym_id.lower():
+        import ale_py
+        gym.register_envs(ale_py)
         envs_lst = [make_atari_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                    run_name, frame_stack=args.frame_stack) for i in range(args.num_envs)]
     elif "minigrid" in args.gym_id.lower():
@@ -200,7 +204,7 @@ if __name__ == "__main__":
     else:
         envs_lst = [make_classic_env(args.gym_id, args.seed + i, i, args.capture_video, 
                                      run_name, masked_indices=args.masked_indices, obs_stack=args.obs_stack) for i in range(args.num_envs)]
-    envs = gym.vector.SyncVectorEnv(envs_lst)
+    envs = gym.vector.SyncVectorEnv(envs_lst, autoreset_mode="SameStep")
 
     agent = Agent(envs, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -263,19 +267,46 @@ if __name__ == "__main__":
 
 
             final_info = info.get('final_info')
-            if final_info is not None and len(final_info) > 0:
-                valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
-                if valid_entries:
-                    episodic_returns = [entry['episode']['r'] for entry in valid_entries]
-                    episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
+            # print(f"Info: {info}")
+            # print(f"FInal Info: {final_info}")
+            if "ale" in args.gym_id.lower():
+                if final_info is not None and len(final_info) > 0:
+
+                    # ① 取布尔掩码；若你的 wrapper 没写 _r/_l，就默认全 True
+                    mask = final_info.get("_r")
+                    if mask is None:
+                        mask = np.ones(final_info["r"].shape[0], dtype=bool)
+
+                    # ② 把 True 的那几个 episode 捞出来
+                    episodic_returns = final_info["r"][mask].flatten()    # 1-D array
+                    episodic_lengths = final_info["l"][mask].flatten()
+
+                    # ③ 若确实有 episode 结束，就计算平均并记录
+                    if episodic_returns.size > 0:
+                        avg_return = float(f"{np.mean(episodic_returns):.3f}")
+                        avg_length = float(f"{np.mean(episodic_lengths):.3f}")
+
+                        episode_infos.append({"r": avg_return, "l": avg_length})
+                        writer.add_scalar("charts/episode_return",  avg_return,  global_step)
+                        writer.add_scalar("charts/episode_length",  avg_length,  global_step)
+                        avg_inference_latency = inference_time_total / args.num_steps
+                        writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
+            elif args.gym_id in ["HalfCheetah-v4", "Hopper-v4", "Walker2d-v4"]:
+                if final_info is not None and len(final_info) > 0:
+                    # valid_entries = [entry for entry in final_info if entry is not None and 'episode' in entry]
+                    # print(f"Valid entries: {valid_entries}")
+                    # if valid_entries:
+                    episode_data = final_info['episode']
+                    episodic_returns = episode_data['r']
+                    episodic_lengths = episode_data['l']
+                    # episodic_returns = [entry['episode']['r'] for entry in valid_entries]
+                    # episodic_lengths = [entry['episode']['l'] for entry in valid_entries]
                     avg_return = float(f'{np.mean(episodic_returns):.3f}')
                     avg_length = float(f'{np.mean(episodic_lengths):.3f}')
                     episode_infos.append({'r': avg_return, 'l': avg_length})
                     writer.add_scalar("charts/episode_return", avg_return, global_step)
                     writer.add_scalar("charts/episode_length", avg_length, global_step)
 
-        avg_inference_latency = inference_time_total / args.num_steps
-        writer.add_scalar("metrics/inference_latency", avg_inference_latency, global_step)
 
         # bootstrap value if not done
         with torch.no_grad():

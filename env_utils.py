@@ -1,16 +1,43 @@
 import gymnasium as gym
 import numpy as np
-from stable_baselines3.common.atari_wrappers import (
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
+# from stable_baselines3.common.atari_wrappers import (
+#     ClipRewardEnv,
+#     EpisodicLifeEnv,
+#     FireResetEnv,
+#     MaxAndSkipEnv,
+#     NoopResetEnv,
+# )
+
+from gymnasium.wrappers import (
+    RecordEpisodeStatistics,
+    ResizeObservation,
+    GrayscaleObservation,
+    FrameStackObservation,
+    RecordVideo,
+    TransformReward,
+    AtariPreprocessing,
 )
+
 import minigrid
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from envs.poc_memory_env import PocMemoryEnv
 from collections import deque
+
+
+class FireResetEnv(gym.Wrapper):
+    """Auto-fire on reset for some Atari envs like Breakout."""
+    def __init__(self, env):
+        super().__init__(env)
+        assert env.unwrapped.get_action_meanings()[1] == 'FIRE'
+        self.fire_action = 1
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        obs, _, terminated, truncated, info = self.env.step(self.fire_action)
+        if terminated or truncated:
+            obs, info = self.env.reset(**kwargs)
+        return obs, info
+
 
 class VecObservationStackWrapper(gym.ObservationWrapper):
     def __init__(self, env, num_stack):
@@ -68,8 +95,17 @@ class RecordEpisodeStatistics(gym.Wrapper):
     # get if the env has lives
     self.has_lives = False
     env.reset()
-    info = env.step(np.zeros(self.num_envs, dtype=int))[-1]
-    if info["lives"].sum() > 0:
+    # info = env.step(np.zeros(self.num_envs, dtype=int))[-1]
+    info = env.step(0)[-1]
+    lives = info.get("lives", 0)
+    if isinstance(lives, np.ndarray):
+        has_lives = lives.sum() > 0
+    else:
+        has_lives = lives > 0
+    # if info["lives"].sum() > 0:
+    #   self.has_lives = True
+    #   print("env has lives")
+    if has_lives:
       self.has_lives = True
       print("env has lives")
 
@@ -85,7 +121,8 @@ class RecordEpisodeStatistics(gym.Wrapper):
   def step(self, action):
     observations, rewards, term, trunc, infos = self.env.step(action)
     dones = term + trunc
-    self.episode_returns += infos["reward"]
+    # self.episode_returns += infos["reward"]
+    self.episode_returns += rewards
     self.episode_lengths += 1
     self.returned_episode_returns[:] = self.episode_returns
     self.returned_episode_lengths[:] = self.episode_lengths
@@ -107,20 +144,61 @@ class RecordEpisodeStatistics(gym.Wrapper):
     )
 
 def make_atari_env(gym_id, seed, idx, capture_video, run_name, frame_stack=1):
+    # def thunk():
+    #     env = gym.make(gym_id, render_mode="rgb_array", repeat_action_probability=0.0) if capture_video else gym.make(gym_id, repeat_action_probability=0.0)
+    #     env = gym.wrappers.RecordEpisodeStatistics(env)
+    #     env = NoopResetEnv(env, noop_max=30)
+    #     #env = MaxAndSkipEnv(env, skip=4)
+    #     env = EpisodicLifeEnv(env)
+    #     if "FIRE" in env.unwrapped.get_action_meanings():
+    #         env = FireResetEnv(env)
+    #     env = ClipRewardEnv(env)
+    #     env = gym.wrappers.ResizeObservation(env, (84, 84))
+    #     env = gym.wrappers.GrayscaleObservation(env)
+    #     # env = GrayScaleObservation(env)
+    #     env = gym.wrappers.FrameStackObservation(env, frame_stack)
+    #     # env = FrameStackObservation(env, stack_size=frame_stack)
+    #     if capture_video and idx == 0:
+    #         env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+    #     env.reset(seed=seed)
+    #     env.action_space.seed(seed)
+    #     env.observation_space.seed(seed)
+    #     return env
     def thunk():
-        env = gym.make(gym_id, render_mode="rgb_array", repeat_action_probability=0.0) if capture_video else gym.make(gym_id, repeat_action_probability=0.0)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        #env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
+        env = gym.make(gym_id, render_mode="rgb_array" if capture_video else None, repeat_action_probability=0.0, frameskip=1)  # <--- 禁用原生 frame skip！)
+        env = RecordEpisodeStatistics(env)
+
+        # AtariPreprocessing handles NoopReset, MaxAndSkip, EpisodicLife, etc.
+        # env = NoopResetEnv(env, noop_max=30)      # 等价于 noop_max=30
+        # env = MaxAndSkipEnv(env, skip=4)          # 等价于 frame_skip=4
+        # env = EpisodicLifeEnv(env)                # 等价于 terminal_on_life_loss=True
+        # env = gym.wrappers.ResizeObservation(env, (84, 84))  # 等价于 screen_size=84
+        # env = gym.wrappers.GrayscaleObservation(env)         # 等价于 grayscale_obs=True
+        env = AtariPreprocessing(
+            env,
+            noop_max=30,
+            frame_skip=4,
+            terminal_on_life_loss=True,
+            screen_size=84,   # Resize to 84x84
+            grayscale_obs=True
+        )
+
+        # FireReset wrapper only for environments that need it
         if "FIRE" in env.unwrapped.get_action_meanings():
             env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, frame_stack)
+
+        # Reward clipping: -1, 0, 1,  等同于 env = ClipRewardEnv(env)
+        # Atari 游戏 reward 分布很不均（如 Q*Bert +25，Breakout +1，Pong ±1
+        # PPO、DQN 等 policy/value based 方法在 early stage 训练时更关注“什么行为有奖励”而不是“奖励有多大”
+        # 在 Atari 大规模实验中，reward clipping 通常提升 early training 收敛速度（但可能略损最终上限）
+        env = TransformReward(env, lambda r: np.sign(r))
+
+        # FrameStack over processed 84x84 grayscale images
+        env = FrameStackObservation(env, stack_size=frame_stack)
+
         if capture_video and idx == 0:
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            env = RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: True)
+
         env.reset(seed=seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
@@ -195,7 +273,7 @@ def make_continuous_env(gym_id, seed, idx, capture_video, run_name, obs_stack=1)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), observation_space=env.observation_space)
         env = gym.wrappers.NormalizeReward(env)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         if capture_video and idx == 0:

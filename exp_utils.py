@@ -30,7 +30,7 @@ def add_common_args(parser):
         help="whether to capture videos of the agent performances (check out `videos` folder)")
     parser.add_argument("--save-interval", type=int, default=100,
         help="Save the model checkpoint every X updates")
-    parser.add_argument("--save_model", type=lambda x:bool(strtobool(x)), default=False,
+    parser.add_argument("--save_model", type=lambda x:bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Whether to save model checkpoints")
 
     # Algorithm specific arguments
